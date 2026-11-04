@@ -45,10 +45,10 @@
 
 将代码文件与 `etf_prices.csv` 放在同一个目录下。
 
-安装回测和绘图所需的依赖：
+在项目目录下打开终端，安装回测和绘图所需的依赖：
 
 ```bash
-python -m pip install numpy pandas scipy matplotlib
+python -m pip install -r requirements.txt
 ```
 
 在项目目录下运行：
@@ -59,7 +59,7 @@ python plot.py
 
 程序会读取已有的价格数据，计算三种组合的目标权重，运行回测并绘制结果。新生成的图片保存在 `figures` 文件夹中。
 
-使用仓库中已有的价格数据进行回测时，无需重新运行下载程序。重新下载数据所需的额外依赖以 `download_data.py` 为准。
+使用仓库已有的价格数据进行回测时，无需联网或重新下载行情。如需更新数据，可在安装依赖后运行 python download_data.py；下载行情需要联网，是否成功取决于接口可用性。
 
 ## 5. 回测结果
 
