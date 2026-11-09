@@ -1,18 +1,20 @@
 import pandas as pd
-#从optimization.py中导入已经定义好的五个函数
+#从optimization.py中导入已经定义好的7个函数
 from optimization import (
     calculate_returns,
     estimate_statistics,
     equal_weight,
     min_variance,
     min_variance_equal_return,
+    risk_parity,
+    select_momentum_etfs,
 )
 import numpy as np
 
 
 def make_rebalance_schedule(
     prices: pd.DataFrame,
-    history_start: str = "2022-01-01",
+    history_start: str | None = None,
     first_signal_month: str = "2025-12",
     last_signal_month: str = "2026-09",
     backtest_end: str = "2026-10-30",
@@ -41,14 +43,14 @@ def make_rebalance_schedule(
     if dates[-1] != end:
         raise ValueError("回测结束日必须在价格表中存在")
 
-    start = pd.Timestamp(history_start)
+    start = pd.Timestamp(history_start) if history_start is not None else pd.NaT
     first_month = pd.Period(first_signal_month, freq="M")
     last_month = pd.Period(last_signal_month, freq="M")
 
     if first_month > last_month:
         raise ValueError("首个信号月份不能晚于最后一个信号月份")
 
-    if start > first_month.start_time:
+    if pd.notna(start) and start > first_month.start_time:
         raise ValueError("历史窗口起点不能晚于首个信号月份的月初")
 
     # 最后一个信号月份必须已经完整结束
@@ -116,8 +118,9 @@ def make_rebalance_schedule(
 def calculate_target_weights(
     returns: pd.DataFrame,
     schedule: pd.DataFrame,
+    prices: pd.DataFrame,
 ) -> dict:
-    """按照调仓计划，计算每一期三种组合的目标权重。"""
+    """按照调仓计划，计算每一期八种组合的目标权重。"""
 
     # 创建空字典，用来保存每一期的计算结果
     results = {}
@@ -135,7 +138,7 @@ def calculate_target_weights(
         # 使用本期历史窗口估计参数
         statistics = estimate_statistics(
             returns=returns,
-            start_date=history_start,
+            start_date=None if pd.isna(history_start) else history_start,
             end_date=signal_date,
         )
 
@@ -143,17 +146,31 @@ def calculate_target_weights(
         mu = statistics["mean_returns"]
         covariance = statistics["covariance"]
 
-        # 每列代表一种组合，每行代表一只ETF
+        # 用截至本期信号日的价格，选出过去 126 个交易日涨幅最高的 5 只 ETF
+        selected = select_momentum_etfs(
+            prices=prices,
+            signal_date=signal_date,
+            lookback=126,
+            top_n=5,
+        )
+
+        # 从全池统计量中取出这 5 只 ETF 对应的均值和协方差
+        selected_mu = mu.loc[selected]
+        selected_covariance = covariance.loc[selected, selected]
+
         weights = pd.DataFrame({
             "等权": equal_weight(mu.index),
-
             "最小方差": min_variance(covariance),
+            "等权收益约束最小方差": min_variance_equal_return(mu, covariance),
+            "风险平价": risk_parity(covariance),
 
-            "等权收益约束最小方差": min_variance_equal_return(
-                mu,
-                covariance,
+            "动量等权": equal_weight(selected),
+            "动量最小方差": min_variance(selected_covariance),
+            "动量收益约束最小方差": min_variance_equal_return(
+                selected_mu, selected_covariance
             ),
-        })
+            "动量风险平价": risk_parity(selected_covariance),
+        }, index=mu.index).fillna(0.0)
 
         # 以执行日期为键，保存本期结果
         results[execution_date] = {
@@ -162,6 +179,7 @@ def calculate_target_weights(
             "参数估计截止日": signal_date,
             "样本数量": len(statistics["window_returns"]),
             "目标权重": weights,
+            "动量入选ETF": selected,
         }
 
     # 全部期数计算完毕后，返回保存好的结果
@@ -197,7 +215,14 @@ def execute_rebalance(
     weights = weights / weights.sum()
 
     # 2. 计算旧持仓市值和调仓前总资产
-    old_values = shares * prices
+    # 旧持仓需要估值，目标权重为正的 ETF 需要有效价格来买入
+    required = shares.ne(0) | weights.gt(0)
+    invalid = required & (~np.isfinite(prices) | prices.le(0))
+    if invalid.any():
+        names = "、".join(prices.index[invalid])
+        raise ValueError(f"调仓时缺少有效收盘价：{names}")
+
+    old_values = shares * prices.where(shares.ne(0), 0.0)
     value_before = float(old_values.sum() + cash)
 
     # 金额容差，单位为元
@@ -246,8 +271,8 @@ def execute_rebalance(
 
     fee = fee_rate * (buy_amount + sell_amount)
 
-    # 6. 计算新份额和剩余现金
-    new_shares = target_values / prices
+    # 6. 计算新份额和剩余现金，目标权重为零时，目标市值和新份额都应为零
+    new_shares = target_values / prices.where(weights.gt(0), 1.0)
 
     new_cash = float(
         value_before - target_values.sum() - fee
@@ -260,7 +285,7 @@ def execute_rebalance(
     new_cash = max(new_cash, 0.0)
 
     value_after = float(
-        (new_shares * prices).sum() + new_cash
+        (new_shares * prices.where(new_shares.ne(0), 0.0)).sum() + new_cash
     )
 
     # 7. 检查资金守恒
@@ -307,16 +332,16 @@ def run_backtest(
     # 执行日期集合，用来判断当天是否需要调仓
     execution_dates = set(schedule["执行日"])
 
-    # 从第一期目标权重表中获取三种组合的名称
+    # 从第一期目标权重表中获取八种组合的名称
     first_execution = schedule["执行日"].iloc[0]
     strategy_names = target_weights[
         first_execution
     ]["目标权重"].columns
 
-    # 保存三种组合各自的回测结果
+    # 保存八种组合各自的回测结果
     results = {}
 
-    # 三种组合分别回测
+    # 八种组合分别回测
     for strategy in strategy_names:
 
         # 初始状态：没有ETF持仓，全部资金为现金
@@ -335,7 +360,13 @@ def run_backtest(
         for date, daily_prices in backtest_prices.iterrows():
 
             # 1. 先按当天收盘价计算旧持仓市值
-            holding_values = shares * daily_prices
+            held = shares.ne(0)
+            invalid = held & (~np.isfinite(daily_prices) | daily_prices.le(0))
+            if invalid.any():
+                names = "、".join(daily_prices.index[invalid])
+                raise ValueError(f"{date:%Y-%m-%d} {strategy} 持仓缺少有效收盘价：{names}")
+
+            holding_values = shares * daily_prices.where(held, 0.0)
             value_before = float(holding_values.sum() + cash)
 
             # 普通持仓日没有交易费用
@@ -380,7 +411,7 @@ def run_backtest(
                 })
 
             # 3. 计算当天交易完成后的资产
-            holding_values = shares * daily_prices
+            holding_values = shares * daily_prices.where(shares.ne(0), 0.0)
             total_value = float(holding_values.sum() + cash)
 
             # 当天收益包含旧持仓涨跌和当天交易费用
@@ -458,8 +489,7 @@ def calculate_performance(
 
         nav = daily["净值"]
 
-        # 第一行是初始资金基准，不是一个实际收益区间
-        # 去掉它，但保留首次建仓日的费用收益
+        # 第一行是初始资金基准，不是一个实际收益区间。去掉它，但保留首次建仓日的费用收益
         returns = daily["日收益率"].iloc[1:]
 
         n = len(returns)
@@ -561,7 +591,6 @@ if __name__ == "__main__":
 
     # 读取与 backtest.py 放在同一文件夹中的价格表
     project_dir = Path(__file__).resolve().parent
-
     prices = pd.read_csv(
         project_dir / "etf_prices.csv",
         index_col="Date",
@@ -569,27 +598,26 @@ if __name__ == "__main__":
         encoding="utf-8-sig",
     )
 
-    # 生成调仓计划
+    # 生成并打印调仓计划，保留原表的日期类型供后续计算
     schedule = make_rebalance_schedule(prices)
-
-    # 仅在打印时将日期格式化，原表仍保留日期类型
     display_schedule = schedule.apply(
-        lambda column: column.dt.strftime("%Y-%m-%d")
+        lambda column: pd.to_datetime(column).dt.strftime("%Y-%m-%d")
     )
-
-    print("调仓计划：")
+    display_schedule["历史窗口起点"] = (
+        display_schedule["历史窗口起点"].fillna("各 ETF 有效历史起点")
+    )
+    print("调仓计划")
     print(display_schedule.to_string())
 
-    # 将价格转换为ETF简单日收益率
+    # 计算日收益率，再生成各期八种组合的目标权重
     returns = calculate_returns(prices)
-
-    # 根据调仓计划，计算并保存各期目标权重
     target_weights = calculate_target_weights(
         returns=returns,
         schedule=schedule,
+        prices=prices,
     )
 
-    # 对三种组合分别进行每日回测
+    # 对八种组合分别进行每日回测
     backtest_results = run_backtest(
         prices=prices,
         schedule=schedule,
@@ -598,8 +626,10 @@ if __name__ == "__main__":
         fee_rate=0.0005,
     )
 
-    # 计算三种组合的绩效指标
+    # 计算并打印八种组合的绩效指标
     performance = calculate_performance(
         backtest_results=backtest_results,
         annual_risk_free_rate=0.02,
     )
+    print("\n八种组合的回测绩效")
+    print(performance.to_string(float_format=lambda value: f"{value:.6f}"))

@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 from matplotlib.ticker import PercentFormatter
+from matplotlib.collections import LineCollection
 
 from optimization import calculate_returns
 
@@ -130,23 +131,26 @@ def plot_performance_table(performance):
         name.replace(
             "等权收益约束最小方差",
             "等权收益约束\n最小方差",
+        ).replace(
+            "动量收益约束最小方差",
+            "动量收益约束\n最小方差",
         )
         for name in table_data.columns
     ]
 
-    fig, ax = plt.subplots(figsize=(8, 4.8))
+    fig, ax = plt.subplots(figsize=(15, 4.8))
     ax.axis("off")
 
     table = ax.table(
         cellText=cell_text,
         colLabels=["指标"] + strategy_labels,
         cellLoc="center",
-        colWidths=[0.28, 0.22, 0.22, 0.28],
+        colWidths=[0.12] + [0.84 / len(strategy_labels)] * len(strategy_labels),
         bbox=[0, 0, 1, 1],
     )
 
     table.auto_set_font_size(False)
-    table.set_fontsize(12)
+    table.set_fontsize(10)
 
     for (row, column), cell in table.get_celld().items():
 
@@ -165,8 +169,8 @@ def plot_performance_table(performance):
             )
 
     # 增加表头高度，容纳两行组合名称
-    for column in range(4):
-        table[(0, column)].set_height(0.08)
+    for column in range(len(strategy_labels) + 1):
+        table[(0, column)].set_height(0.06)
 
     fig.subplots_adjust(
         left=0.01,
@@ -184,7 +188,7 @@ def plot_performance_table(performance):
 # ==================== 三、净值曲线 ====================
 
 def plot_nav(backtest_results, strategy_colors):
-    """绘制三种组合扣费后的净值曲线。"""
+    """绘制八种组合扣费后的净值曲线。"""
 
     fig, ax = plt.subplots(figsize=(12, 5))
 
@@ -200,6 +204,7 @@ def plot_nav(backtest_results, strategy_colors):
             nav,
             label=strategy,
             color=strategy_colors[strategy],
+            linestyle="--" if strategy.startswith("动量") else "-",
             linewidth=1.8,
         )
 
@@ -211,7 +216,7 @@ def plot_nav(backtest_results, strategy_colors):
         linewidth=0.9,
     )
 
-    ax.set_title("三种组合的净值比较（扣费后）")
+    ax.set_title("八种组合的净值比较（扣费后）")
     ax.set_ylabel("净值（初始资金 = 1）")
 
     format_date_axis(ax)
@@ -247,6 +252,7 @@ def plot_drawdown(backtest_results, strategy_colors):
             drawdown,
             label=strategy,
             color=strategy_colors[strategy],
+            linestyle="--" if strategy.startswith("动量") else "-",
             linewidth=1.6,
         )
 
@@ -260,7 +266,7 @@ def plot_drawdown(backtest_results, strategy_colors):
         PercentFormatter(xmax=1)
     )
 
-    ax.set_title("三种组合的回撤比较")
+    ax.set_title("八种组合的回撤比较")
     ax.set_ylabel("回撤")
 
     format_date_axis(ax)
@@ -312,11 +318,11 @@ def plot_allocation(strategy, result):
 
     # 前五只按平均权重排名依次分配颜色
     colors = [
-        "#0066FF",  # 第一名：亮蓝
-        "#FF8800",  # 第二名：亮橙
-        "#00CC44",  # 第三名：亮绿
-        "#AA33FF",  # 第四名：亮紫
-        "#FF3344",  # 第五名：亮红
+        "#00BFFF",  # 第一名：青蓝
+        "#FF8FB3",  # 第五名：亮粉
+        "#00CC22",  # 第三名：亮绿
+        "#0066FF",  # 第四名：亮钴蓝
+        "#FFE34D",  # 第二名：柠檬黄
         "#E0E0E0",  # 其余ETF：浅灰
     ]
 
@@ -405,6 +411,9 @@ def plot_turnover(backtest_results, strategy_colors):
             width=width,
             label=strategy,
             color=strategy_colors[strategy],
+            edgecolor="white",
+            linewidth=0,
+            hatch="//" if strategy.startswith("动量") else "",
         )
 
     labels = [
@@ -439,7 +448,7 @@ def plot_turnover(backtest_results, strategy_colors):
         0.08,
         0.02,
         "双边换手率 =（买入金额 + 卖出金额）/ 调仓前总资产；"
-        "三种组合的调仓日期相同，主要比较每次调整幅度。",
+        "八种组合的调仓日期相同，主要比较每次调整幅度。",
         fontsize=9,
         color="#667580",
     )
@@ -449,23 +458,167 @@ def plot_turnover(backtest_results, strategy_colors):
     return fig
 
 
-# ==================== 七、统一绘图并保存 ====================
+# ==================== 七、资产类别暴露对比图 ====================
+
+def plot_asset_exposure(backtest_results):
+    """比较八种组合建仓后的平均资产类别权重。"""
+
+    asset_groups = {
+        "A股": ["沪深300", "中证500", "创业板", "上证红利"],
+        "港股": ["恒生ETF"],
+        "美股": ["纳斯达克100"],
+        "欧股": ["德国DAX"],
+        "债券": ["5年期国债", "城投债"],
+        "黄金": ["黄金ETF"],
+    }
+
+    # 这里的颜色对应资产类别
+    category_colors = {
+        "A股": "#00BFFF",
+        "港股": "#FF2020",
+        "美股": "#0066FF",
+        "欧股": "#FF7700",
+        "债券": "#00CC22",
+        "黄金": "#FFE34D",
+    }
+
+    exposure_records = {}
+
+    for strategy, result in backtest_results.items():
+        weights = result["实际权重"].sort_index()
+        first_execution = result["交易记录"].index.min()
+
+        # 排除首次建仓前的全现金基准日
+        average_weights = weights.loc[first_execution:].mean()
+
+        # 用完整的 ETF 权重表，逐类汇总
+        exposure_records[strategy] = {
+            category: average_weights.loc[etfs].sum()
+            for category, etfs in asset_groups.items()
+        }
+
+    # 每行是一个组合，每列是一个资产类别
+    exposure = pd.DataFrame.from_dict(exposure_records, orient="index")
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+
+    exposure.plot.barh(
+        ax=ax,
+        stacked=True,
+        color=[category_colors[category] for category in exposure.columns],
+        width=0.7,
+    )
+
+    # 让等权组合显示在最上面
+    ax.invert_yaxis()
+
+    ax.set_xlim(0, 1)
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1))
+    ax.set_title("各组合的平均资产类别配置")
+    ax.set_xlabel("建仓后平均实际权重")
+    ax.set_ylabel("")
+    ax.grid(axis="x", alpha=0.2)
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=6)
+
+    fig.tight_layout()
+    return fig
+
+
+# ==================== 八、月度收益对比图 ====================
+def plot_monthly_returns(backtest_results, strategy_colors):
+    """按配权方法成对比较全池版和动量版的月度扣费后收益。"""
+
+    strategy_pairs = [
+        ("等权", "动量等权"),
+        ("最小方差", "动量最小方差"),
+        ("等权收益约束最小方差", "动量收益约束最小方差"),
+        ("风险平价", "动量风险平价"),
+    ]
+
+    monthly_records = {}
+
+    for strategy, result in backtest_results.items():
+        daily = result["每日记录"].sort_index()
+
+        # 第一行只是初始资金基准。首次建仓日的收益仍然保留
+        daily_returns = daily["日收益率"].iloc[1:]
+
+        # 同一个自然月的日期归到一组
+        months = daily_returns.index.to_period("M")
+        monthly_records[strategy] = (
+            (1 + daily_returns).groupby(months).prod() - 1
+        )
+
+    # 每行是一个月，每列是一个组合
+    monthly_returns = pd.DataFrame(monthly_records).sort_index()
+
+    fig, axes = plt.subplots(
+        2, 2, figsize=(13, 7), sharex=True, sharey=True
+    )
+
+    x = np.arange(len(monthly_returns))
+    width = 0.36
+
+    for ax, (full_pool, momentum) in zip(axes.flat, strategy_pairs):
+        color = strategy_colors[full_pool]
+
+        ax.bar(
+            x - width / 2,
+            monthly_returns[full_pool],
+            width=width,
+            color=color,
+            label="全池",
+        )
+        ax.bar(
+            x + width / 2,
+            monthly_returns[momentum],
+            width=width,
+            color=color,
+            edgecolor="white",
+            linewidth=0.5,
+            hatch="//",
+            label="动量",
+        )
+
+        ax.set_title(full_pool)
+        ax.axhline(0, color="#777777", linewidth=0.8)
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1))
+        ax.grid(axis="y", alpha=0.2)
+        ax.set_axisbelow(True)
+        ax.legend(loc="best")
+
+    month_labels = monthly_returns.index.strftime("%Y-%m")
+    for ax in axes[-1]:
+        ax.set_xticks(x, month_labels, rotation=30, ha="right")
+
+    fig.suptitle("各组合的月度收益比较（扣费后）")
+    fig.tight_layout()
+    return fig
+
+
+# ==================== 九、统一绘图并保存 ====================
 
 def plot_all(
     backtest_results,
     performance,
     output_dir,
 ):
-    """生成五类图表，共七张图片。"""
+    """生成五类图表，共12张图片。"""
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 三种组合在净值、回撤和换手率图中的固定颜色
+    # 八种组合在净值、回撤、换手率图、资产类别暴露对比图和月度收益对比图中的固定颜色，同一种配权方法的全池版和动量版使用同一种颜色，不同线型
     strategy_colors = {
-        "等权": "#0066FF",  # 亮蓝
-        "最小方差": "#FF8800",  # 亮橙
-        "等权收益约束最小方差": "#00CC44",  # 亮绿
+        "等权": "#00BFFF",  # 青蓝
+        "动量等权": "#00BFFF",
+        "最小方差": "#FFE34D",  # 柠檬黄
+        "动量最小方差": "#FFE34D",
+        "等权收益约束最小方差": "#FF2020",  # 亮红
+        "动量收益约束最小方差": "#FF2020",
+        "风险平价": "#00CC22",  # 亮绿
+        "动量风险平价": "#00CC22",
     }
 
     figures = {}
@@ -505,6 +658,17 @@ def plot_all(
         strategy_colors,
     )
 
+    #第六类：资产类别暴露对比图
+    figures["06_asset_exposure"] = plot_asset_exposure(
+        backtest_results,
+    )
+
+    #第七类：月度收益对比图
+    figures["07_monthly_returns"] = plot_monthly_returns(
+        backtest_results,
+        strategy_colors,
+    )
+
     # 保存图片
     for filename, fig in figures.items():
 
@@ -519,7 +683,7 @@ def plot_all(
     plt.show()
 
 
-# ==================== 八、运行入口 ====================
+# ==================== 十、运行入口 ====================
 
 if __name__ == "__main__":
 
@@ -544,6 +708,7 @@ if __name__ == "__main__":
     target_weights = calculate_target_weights(
         returns=returns,
         schedule=schedule,
+        prices=prices,
     )
 
     # 运行每日回测

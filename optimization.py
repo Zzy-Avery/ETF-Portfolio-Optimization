@@ -31,7 +31,7 @@ def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
 def estimate_statistics(
     returns: pd.DataFrame,
     end_date: str,
-    start_date: str = "2022-01-01",
+    start_date: str | None = None,
 ) -> dict:
     """计算从固定起点到指定截止日期的日度统计量。"""
 
@@ -44,24 +44,34 @@ def estimate_statistics(
     if returns.columns.has_duplicates:
         raise ValueError("收益率表存在重复的 ETF 列名")
 
-    start = pd.Timestamp(start_date)
+    start = pd.Timestamp(start_date) if start_date is not None else None
     end = pd.Timestamp(end_date)
 
-    if pd.isna(start) or pd.isna(end):
+    if pd.isna(end) or (start is not None and pd.isna(start)):
         raise ValueError("开始日期和截止日期不能为空")
-
-    if start > end:
+    if start is not None and start > end:
         raise ValueError("开始日期不能晚于截止日期")
 
-    # 起点固定，截止日期随每次调仓更新
     window = returns.sort_index().loc[start:end].copy()
 
-    if len(window) < 2 or window.shape[1] == 0:
-        raise ValueError("历史窗口至少需要两条收益率记录和一只 ETF")
+    if window.shape[1] == 0:
+        raise ValueError("历史窗口至少需要一只 ETF")
+    if np.isinf(window.to_numpy(dtype=float)).any():
+        raise ValueError("所选窗口的收益率存在无穷值")
 
-    # 不让缺失值或无穷值被忽略后继续计算
-    if not np.isfinite(window.to_numpy(dtype=float)).all():
-        raise ValueError("所选窗口的收益率存在缺失值或无穷值")
+    valid = window.notna().astype(np.int64)
+    pair_counts = valid.T @ valid
+
+    rows, cols = np.where(np.triu(pair_counts.to_numpy() < 2))
+    if len(rows):
+        pairs = [
+            f"{window.columns[i]} / {window.columns[j]}"
+            for i, j in zip(rows, cols)
+        ]
+        raise ValueError(
+            f"截至 {end:%Y-%m-%d} 的有效共同收益不足两条："
+            + "、".join(pairs)
+        )
 
     # 每只 ETF 的平均日收益率
     mean_returns = window.mean()
@@ -70,16 +80,37 @@ def estimate_statistics(
     volatility = window.std(ddof=1)
 
     # 日收益率样本协方差矩阵
-    covariance = window.cov()
+    pairwise_covariance = window.cov()
 
     # 日收益率相关系数矩阵
     correlation = window.corr()
+
+    sigma = pairwise_covariance.to_numpy()
+    covariance = pairwise_covariance.copy()
+
+    min_eigenvalue = np.linalg.eigvalsh(sigma).min()
+    if min_eigenvalue < -1e-10 * np.abs(sigma).max():
+        diagonal = np.diag(np.diag(sigma))
+
+        # 找到能保留的最大非对角线比例
+        low, high = 0.0, 1.0
+        for _ in range(50):
+            weight = (low + high) / 2
+            candidate = weight * sigma + (1 - weight) * diagonal
+            if np.linalg.eigvalsh(candidate).min() >= 0:
+                low = weight
+            else:
+                high = weight
+
+        covariance.iloc[:, :] = low * sigma + (1 - low) * diagonal
 
     return {
         "window_returns": window,
         "mean_returns": mean_returns,
         "volatility": volatility,
         "covariance": covariance,
+        "pairwise_covariance": pairwise_covariance,
+        "pair_counts": pair_counts,
         "correlation": correlation,
     }
 
@@ -309,12 +340,97 @@ def min_variance_equal_return(
     )
 
 
+def risk_parity(covariance: pd.DataFrame) -> pd.Series:
+    """计算只做多、等风险贡献的组合权重。"""
+    if covariance.empty or not covariance.index.equals(covariance.columns):
+        raise ValueError("风险平价要求协方差矩阵的行列资产一致且非空")
+    if covariance.index.has_duplicates:
+        raise ValueError("ETF 名称不能重复")
+
+    sigma = covariance.to_numpy(dtype=float)
+    if not np.isfinite(sigma).all() or not np.allclose(
+        sigma, sigma.T, rtol=1e-8, atol=1e-12
+    ):
+        raise ValueError("风险平价要求协方差矩阵有限且对称")
+
+    sigma = (sigma + sigma.T) / 2
+    if (np.diag(sigma) <= 0).any():
+        raise ValueError("等风险贡献要求每只 ETF 的方差为正")
+
+    # 用各资产的波动率缩放坐标，减小波动率差异对迭代的影响。
+    volatility = np.sqrt(np.diag(sigma))
+    scaled = sigma / volatility[:, None] / volatility[None, :]
+    if np.linalg.eigvalsh(scaled).min() < -1e-10:
+        raise ValueError("风险平价要求协方差矩阵半正定")
+
+    n = len(sigma)
+    budget = 1.0 / n
+    x = np.full(n, np.sqrt(budget))
+
+    # 每一轮依次更新所有资产的辅助变量 x_i。
+    for _ in range(5000):
+        for i, row in enumerate(scaled):
+            diagonal = row[i]
+            other = row @ x - diagonal * x[i]
+
+            # 解 diagonal * x_i**2 + other * x_i - budget = 0 的正根。
+            root = np.hypot(other, 2 * np.sqrt(diagonal * budget))
+            if other >= 0:
+                x[i] = 2 * budget / (root + other)
+            else:
+                x[i] = (root - other) / (2 * diagonal)
+
+        # 更新完一整轮，再检查所有资产的风险贡献。
+        contributions = x * (scaled @ x)
+        if np.allclose(contributions, budget, rtol=0, atol=1e-7 * budget):
+            weights = x / volatility
+            weights /= weights.sum()
+            return pd.Series(weights, index=covariance.index, name="weight")
+
+    raise RuntimeError("风险平价未收敛，无法验证各 ETF 的风险贡献相等")
+
+
+def select_momentum_etfs(
+    prices: pd.DataFrame,
+    signal_date: str,
+    lookback: int = 126,
+    top_n: int = 5,
+) -> pd.Index:
+    """按截至信号日的累计涨幅排名，返回前 top_n 只 ETF。"""
+    # 只使用信号日及之前的价格，取最后 127 行对应 126 个收益区间。
+    history = prices.sort_index().loc[:pd.Timestamp(signal_date)]
+    window = history.tail(lookback + 1)
+
+    if len(window) < lookback + 1:
+        raise ValueError(f"动量排名至少需要 {lookback + 1} 个交易日的价格")
+
+    # 所有 ETF 使用相同的起止日期。
+    start_prices = window.iloc[0]
+    end_prices = window.iloc[-1]
+
+    # 两端都有有效价格的 ETF 才参加排名。
+    valid = (
+        np.isfinite(start_prices)
+        & np.isfinite(end_prices)
+        & (start_prices > 0)
+        & (end_prices > 0)
+    )
+
+    if valid.sum() < top_n:
+        raise ValueError(f"动量排名只有 {valid.sum()} 只 ETF 有有效价格，少于 {top_n} 只")
+
+    momentum = end_prices[valid] / start_prices[valid] - 1
+
+    # 涨幅相同时，按价格表原来的列顺序决定先后。
+    ranking = momentum.sort_values(ascending=False, kind="stable")
+    return ranking.head(top_n).index
+
+
 if __name__ == "__main__":
     from pathlib import Path
 
-    # 读取与 optimization.py 放在同一文件夹中的价格表
+    # 读取与 optimization.py 放在同一文件夹的价格表
     project_dir = Path(__file__).resolve().parent
-
     prices = pd.read_csv(
         project_dir / "etf_prices.csv",
         index_col="Date",
@@ -322,44 +438,62 @@ if __name__ == "__main__":
         encoding="utf-8-sig",
     )
 
-    # 计算日收益率
-    returns = calculate_returns(prices)
+    signal_date = "2025-12-31"
 
-    # 第一次配置只使用 2022—2025 年的数据
-    statistics = estimate_statistics(
-        returns,
-        end_date="2025-12-31",
-    )
+    # 全池参数估计仍使用各 ETF 截至信号日的有效历史。
+    returns = calculate_returns(prices)
+    statistics = estimate_statistics(returns, end_date=signal_date)
 
     mu = statistics["mean_returns"]
     covariance = statistics["covariance"]
 
-    # 分别计算三种组合权重
+    # 用最近 126 个交易日的涨幅选出前 5 只。
+    selected = select_momentum_etfs(
+        prices,
+        signal_date=signal_date,
+        lookback=126,
+        top_n=5,
+    )
+
+    # 从全池估计结果中取出入选 ETF 的均值和协方差子矩阵。
+    selected_mu = mu.loc[selected]
+    selected_covariance = covariance.loc[selected, selected]
+
+    # 原来的四种组合用全池，动量版的四种组合用同一份入选名单。
     weights = pd.DataFrame({
         "等权": equal_weight(mu.index),
         "最小方差": min_variance(covariance),
-        "等权收益约束最小方差": min_variance_equal_return(
-            mu,
-            covariance,
+        "等权收益约束最小方差": min_variance_equal_return(mu, covariance),
+        "风险平价": risk_parity(covariance),
+        "动量等权": equal_weight(selected),
+        "动量最小方差": min_variance(selected_covariance),
+        "动量收益约束最小方差": min_variance_equal_return(
+            selected_mu, selected_covariance
         ),
-    })
+        "动量风险平价": risk_parity(selected_covariance),
+    }, index=mu.index).fillna(0.0)
 
-    print("三种组合的目标权重：")
+    print("\n动量入选 ETF（按涨幅从高到低）：")
+    print("、".join(selected))
+
+    print("\n八种组合的目标权重：")
     print(weights.to_string(float_format=lambda x: f"{x:.4%}"))
 
-    # 使用同一组历史参数，计算三种组合的估计收益和风险
+    # 按权重表的 ETF 顺序排列均值和协方差，再转成数组参与计算
+    asset_order = weights.index
+    mean_array = mu.loc[asset_order].to_numpy()
+    sigma = covariance.loc[asset_order, asset_order].to_numpy()
+
+    # 计算每种组合的估计收益、方差和波动率
     comparison = pd.DataFrame(
         index=weights.columns,
         columns=["估计平均日收益率", "估计日方差", "估计日波动率"],
         dtype=float,
     )
 
-    sigma = covariance.to_numpy()
-
     for name in weights.columns:
         w = weights[name].to_numpy()
-
-        portfolio_return = mu.to_numpy() @ w
+        portfolio_return = mean_array @ w
         portfolio_variance = w @ sigma @ w
 
         comparison.loc[name] = [
@@ -371,10 +505,21 @@ if __name__ == "__main__":
     print("\n历史参数下的组合比较：")
     print(comparison.to_string(float_format=lambda x: f"{x:.8f}"))
 
-    # 检查权重；允许微小浮点误差
-    weight_tol = 1e-8
+    # 先算出风险贡献占比，再在下面的 checks 中使用它
+    rp_weights = weights["风险平价"].to_numpy()
+    risk_contributions = rp_weights * (sigma @ rp_weights)
+    risk_shares = risk_contributions / risk_contributions.sum()
+    target_risk_share = 1.0 / len(risk_shares)
 
-    # 收益、方差检查分别使用与输入尺度对应的容差
+    print("\n风险平价组合的风险贡献占比：")
+    print(
+        pd.Series(risk_shares, index=asset_order).to_string(
+            float_format=lambda x: f"{x:.4%}"
+        )
+    )
+
+    # 检查权重、收益约束、方差关系及风险平价条件
+    weight_tol = 1e-8
     return_tol = 1e-8 * max(float(mu.abs().max()), 1e-12)
     variance_tol = 1e-8 * max(float(np.abs(sigma).max()), 1e-12)
 
@@ -388,6 +533,21 @@ if __name__ == "__main__":
     constrained_variance = comparison.loc[
         "等权收益约束最小方差", "估计日方差"
     ]
+
+    # 取出三个动量组合的估计收益和方差
+    momentum_eq = comparison.loc["动量等权"]
+    momentum_min = comparison.loc["动量最小方差"]
+    momentum_constrained = comparison.loc["动量收益约束最小方差"]
+
+    # 动量等权只对入选 ETF 平均分配资金
+    momentum_eq_weights = weights.loc[selected, "动量等权"].to_numpy()
+    target_share = 1.0 / len(selected)
+
+    # 动量风险平价只在入选 ETF 中计算风险贡献占比
+    momentum_rp_weights = weights.loc[selected, "动量风险平价"].to_numpy()
+    momentum_sigma = selected_covariance.to_numpy()
+    risk_contributions = momentum_rp_weights * (momentum_sigma @ momentum_rp_weights)
+    total_variance = risk_contributions.sum()
 
     checks = {
         "所有权重均为有限数": np.isfinite(weights.to_numpy()).all(),
@@ -406,6 +566,36 @@ if __name__ == "__main__":
         ),
         "收益约束组合的方差不高于等权": (
             constrained_variance <= eq_variance + variance_tol
+        ),
+        "风险平价组合的风险贡献占比相等": np.allclose(
+            risk_shares, target_risk_share, rtol=0, atol=1e-6
+        ),
+        "动量等权对入选ETF平均配权": np.allclose(
+            momentum_eq_weights, target_share, rtol=0, atol=weight_tol
+        ),
+        "动量最小方差的方差不高于动量等权": (
+                momentum_min["估计日方差"]
+                <= momentum_eq["估计日方差"] + variance_tol
+        ),
+        "动量最小方差的方差不高于动量收益约束组合": (
+                momentum_min["估计日方差"]
+                <= momentum_constrained["估计日方差"] + variance_tol
+        ),
+        "动量收益约束组合的估计收益不低于动量等权": (
+                momentum_constrained["估计平均日收益率"]
+                >= momentum_eq["估计平均日收益率"] - return_tol
+        ),
+        "动量收益约束组合的方差不高于动量等权": (
+                momentum_constrained["估计日方差"]
+                <= momentum_eq["估计日方差"] + variance_tol
+        ),
+        "动量风险平价的入选ETF风险贡献占比相等": (
+                total_variance > 0
+                and np.allclose(
+            risk_contributions / total_variance,
+            target_share,
+            rtol=0,
+            atol=1e-6)
         ),
     }
 
