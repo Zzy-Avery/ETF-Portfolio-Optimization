@@ -1,11 +1,7 @@
 """
 数据获取模块
 ============
-通过AKShare调用腾讯接口获取ETF历史日线行情。
-
-用法：
-    df = get_etf("沪深300")
-    prices = get_etfs(["沪深300", "中证红利", "黄金ETF"])
+通过东方财富接口获取ETF历史日线行情。
 
 注意：
 1. 默认请求后复权行情，adjust="hfq"。
@@ -15,6 +11,7 @@
 
 from json import load
 from pathlib import Path
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import numpy as np
@@ -23,10 +20,7 @@ import pandas as pd
 DEFAULT_START = "2010-01-01"
 DEFAULT_END = "2026-10-30"
 
-TENCENT_URL = (
-    "https://proxy.finance.qq.com"
-    "/ifzqgtimg/appstock/app/newfqkline/get"
-)
+EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
 #涵盖 A 股、港股、美股、欧股、债券和黄金
 ETF_POOL = {
@@ -56,60 +50,43 @@ LISTING_DATES = {
 }
 
 
-def _download_tencent_daily(ticker, start_date, end_date, adjust):
-    """逐年下载一只 ETF 的日线。"""
-    field = f"{adjust}day"
-    rows = []
+def _download_eastmoney_daily(ticker, start_date, end_date, adjust):
+    """下载一只 ETF 在指定日期区间内的东方财富日线。"""
 
-    for year in range(start_date.year, end_date.year + 1):
-        year_start = pd.Timestamp(year=year, month=1, day=1)
-        year_end = pd.Timestamp(year=year, month=12, day=31)
+    # 东方财富用 1 表示沪市，0 表示深市。
+    # 例如 sh513030 转成 1.513030，sz159915 转成 0.159915。
+    market = "1" if ticker.startswith("sh") else "0"
+    adjustment_codes = {"": "0", "qfq": "1", "hfq": "2"}
 
-        first = max(start_date, year_start)
-        last = min(end_date, year_end)
+    params = {
+        "secid": f"{market}.{ticker[2:]}",
+        "klt": "101",
+        "fqt": adjustment_codes[adjust],
+        "beg": start_date.strftime("%Y%m%d"),
+        "end": end_date.strftime("%Y%m%d"),
+        "lmt": "6000",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56",
+    }
+    url = f"{EASTMONEY_URL}?{urlencode(params)}"
 
-        # 用自然年分段请求，随后按这只 ETF 的实际区间过滤。
-        param = (
-            f"{ticker},day,{year_start:%Y-%m-%d},"
-            f"{last:%Y-%m-%d},640,{adjust}"
-        )
-        url = f"{TENCENT_URL}?param={param}"
+    for attempt in range(3):
+        try:
+            with urlopen(url, timeout=12) as response:
+                payload = load(response)
 
-        for attempt in range(3):
-            try:
-                with urlopen(url, timeout=12) as response:
-                    payload = load(response)
+            if payload.get("rc") != 0:
+                raise ValueError(f"东方财富接口返回错误码 {payload.get('rc')}")
 
-                if payload.get("code") != 0:
-                    raise ValueError(payload.get("msg") or "腾讯接口返回错误")
+            data = payload.get("data") or {}
+            klines = data.get("klines") or []
 
-                ticker_data = (payload.get("data") or {}).get(ticker, {})
-                if field not in ticker_data:
-                    raise ValueError(f"腾讯接口没有返回 {field} 字段")
+            # 每条日线是逗号分隔的字符串，拆成 get_etf() 原来接收的格式。
+            return [line.split(",") for line in klines]
 
-                break
-
-            except (OSError, ValueError) as exc:
-                if attempt == 2:
-                    raise RuntimeError(
-                        f"{ticker} 的 {year} 年行情下载失败：{exc}"
-                    ) from exc
-
-        first_text = first.strftime("%Y-%m-%d")
-        last_text = last.strftime("%Y-%m-%d")
-
-        # 接口可能附带区间外的记录，只保留本段内的数据。
-        year_rows = [
-            row for row in ticker_data[field]
-            if first_text <= row[0] <= last_text
-        ]
-
-        if not year_rows and first == year_start and last == year_end:
-            raise RuntimeError(f"{ticker} 的 {year} 年未返回任何日线")
-
-        rows.extend(year_rows)
-
-    return rows
+        except (OSError, ValueError) as exc:
+            if attempt == 2:
+                raise RuntimeError(f"{ticker} 的东方财富行情下载失败：{exc}") from exc
 
 
 def get_etf(
@@ -146,16 +123,11 @@ def get_etf(
     if effective_start > end_date:
         raise ValueError(f"{name_or_ticker} 在指定区间内尚未上市")
 
-    # 默认下载口径：德国 DAX 用普通日线，其余 ETF 用后复权日线，与东方财富后复权行情逐日对照后，德国 DAX 2,948 个收益率中有 2,943 个一致，最大差异约为 0.09 个百分点。
-    actual_adjust = "" if ticker == "sh513030" and adjust == "hfq" else adjust
-
-    rows = _download_tencent_daily(
-        ticker, effective_start, end_date, actual_adjust
+    rows = _download_eastmoney_daily(
+        ticker, effective_start, end_date, adjust
     )
-    if not rows:
-        raise ValueError(f"{name_or_ticker} 在指定日期范围内没有行情")
 
-    # 腾讯字段顺序：日期、开盘、收盘、最高、最低、成交量。
+    # 东方财富字段顺序：日期、开盘、收盘、最高、最低、成交量。
     df = pd.DataFrame(
         [row[:6] for row in rows],
         columns=["Date", "Open", "Close", "High", "Low", "Volume"],
@@ -179,10 +151,10 @@ def get_etf(
     ):
         raise ValueError(f"{name_or_ticker} 存在无效价格或成交量")
 
-    df.attrs["source"] = "腾讯 newfqkline"
+    df.attrs["source"] = "东方财富 newfqkline"
     df.attrs["ticker"] = ticker
     df.attrs["adjust_requested"] = adjust
-    df.attrs["adjust_used"] = actual_adjust
+    df.attrs["adjust_used"] = adjust
 
     return df
 
