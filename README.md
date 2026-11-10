@@ -63,9 +63,7 @@
 
 ## 4. 运行方法
 
-将代码文件与 `etf_prices.csv` 放在同一个目录下。
-
-在项目目录下打开终端，安装回测和绘图所需的依赖：
+将代码文件与 `etf_prices.csv` 放在同一个目录下。在项目目录下打开终端，安装回测和绘图所需的依赖：
 
 ```bash
 python -m pip install -r requirements.txt
