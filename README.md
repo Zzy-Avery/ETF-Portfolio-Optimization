@@ -77,37 +77,55 @@ python -m pip install -r requirements.txt
 python plot.py
 ```
 
-程序会读取已有的价格数据，计算三种组合的目标权重，运行回测并绘制结果。新生成的图片保存在 `figures` 文件夹中。
+程序会读取已有的价格数据，计算八种组合的目标权重，运行回测并绘制结果。新生成的图片保存在 `figures` 文件夹中。
 
 使用仓库已有的价格数据进行回测时，无需联网或重新下载行情。如需更新数据，可在安装依赖后运行 `python download_data.py`；下载行情需要联网，是否成功取决于接口可用性。
 
 ## 5. 回测结果
 
-重点比较三种组合的累计收益、年化收益、年化波动率、夏普比率、Calmar比率、最大回撤、换手率与累计交易费用，并结合权重变化观察各组合的资产配置差异。
+比较八种组合的累计收益、年化收益、年化波动率、夏普比率、Calmar 比率、最大回撤、换手率与累计交易费用，并结合月度收益和持仓权重，观察不同选池方式与配权方法的表现差异。
 
 ### 绩效指标
 
-![绩效指标对比](01_performance.png)
+![八种组合绩效指标对比](01_performance.png)
 
 ### 组合净值
 
-![组合净值对比](02_nav.png)
+![八种组合扣费后净值对比](02_nav.png)
 
 ### 回撤曲线
 
-![组合回撤对比](03_drawdown.png)
+![八种组合回撤对比](03_drawdown.png)
 
 ### 资产配置
 
-![资产配置图1](04_allocation_1.png)
+![资产配置图 1](04_allocation_1.png)
 
-![资产配置图2](04_allocation_2.png)
+![资产配置图 2](04_allocation_2.png)
 
-![资产配置图3](04_allocation_3.png)
+![资产配置图 3](04_allocation_3.png)
+
+![资产配置图 4](04_allocation_4.png)
+
+![资产配置图 5](04_allocation_5.png)
+
+![资产配置图 6](04_allocation_6.png)
+
+![资产配置图 7](04_allocation_7.png)
+
+![资产配置图 8](04_allocation_8.png)
 
 ### 换手率
 
-![换手率对比](05_turnover.png)
+![八种组合双边换手率对比](05_turnover.png)
+
+### 资产类别暴露
+
+![八种组合的平均资产类别配置](06_asset_exposure.png)
+
+### 月度收益
+
+![全池版与动量版月度收益对比](07_monthly_returns.png)
 
 ## 6. 结果分析
 
