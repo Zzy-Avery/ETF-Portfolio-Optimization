@@ -279,8 +279,8 @@ def plot_drawdown(backtest_results, strategy_colors):
 
 # ==================== 五、实际资产配置图 ====================
 
-def plot_allocation(strategy, result):
-    """按平均实际权重选出前五只ETF，其余合并。"""
+def plot_allocation(ax, strategy, result):
+    """按平均实际权重选出前五只ETF，其余合并。在指定子图上绘制一个组合的每日实际资产配置。"""
 
     # 每日实际权重，而不是调仓目标权重
     weights = result["实际权重"].sort_index().copy()
@@ -326,8 +326,6 @@ def plot_allocation(strategy, result):
         "#E0E0E0",  # 其余ETF：浅灰
     ]
 
-    fig, ax = plt.subplots(figsize=(12, 5.5))
-
     ax.stackplot(
         grouped_weights.index,
         grouped_weights.to_numpy().T,
@@ -339,33 +337,17 @@ def plot_allocation(strategy, result):
     )
 
     ax.set_ylim(0, 1)
+    ax.set_yticks([0, 0.25, 0.50, 0.75, 1])
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1))
 
-    ax.yaxis.set_major_formatter(
-        PercentFormatter(xmax=1)
-    )
-
-    ax.set_title(f"{strategy}：每日实际资产配置")
-    ax.set_ylabel("占总资产的权重")
-
+    ax.set_title(strategy)
     format_date_axis(ax)
 
     ax.legend(
         loc="upper left",
         bbox_to_anchor=(1.02, 1),
-    )
-
-    fig.text(
-        0.08,
-        0.02,
-        "主要五只按建仓后平均实际权重从高到低选取；"
-        "其余ETF合并为灰色。颜色表示排名，资产名称以图例为准。",
         fontsize=9,
-        color="#667580",
     )
-
-    fig.tight_layout(rect=[0, 0.05, 1, 1])
-
-    return fig
 
 
 # ==================== 六、调仓换手率图 ====================
@@ -640,17 +622,47 @@ def plot_all(
         strategy_colors,
     )
 
-    # 第四类：每个组合各一张实际资产配置图
-    for number, (strategy, result) in enumerate(
-        backtest_results.items(),
-        start=1,
-    ):
-        figures[f"04_allocation_{number}"] = (
-            plot_allocation(
-                strategy,
-                result,
-            )
+    # 第四类：资产配置图，全池版、动量版各画一张 2×2 的配置图
+    allocation_groups = {
+        "full_pool": (
+            "全池版",
+            ("等权", "最小方差", "等权收益约束最小方差", "风险平价"),
+        ),
+        "momentum": (
+            "动量版",
+            ("动量等权", "动量最小方差", "动量收益约束最小方差", "动量风险平价"),
+        ),
+    }
+
+    for filename, (group_title, strategies) in allocation_groups.items():
+        fig, axes = plt.subplots(
+            2, 2,
+            figsize=(15, 8),
+            sharex=True,
+            sharey=True,
         )
+
+        # axes.flat 按左上、右上、左下、右下的顺序取子图
+        for ax, strategy in zip(axes.flat, strategies):
+            plot_allocation(ax, strategy, backtest_results[strategy])
+
+        # 上排省去重复的横轴标题，左列保留纵轴标题
+        for ax in axes[0]:
+            ax.set_xlabel("")
+        for ax in axes[:, 0]:
+            ax.set_ylabel("占总资产的权重")
+
+        fig.suptitle(f"{group_title}每日实际资产配置")
+        fig.text(
+            0.05, 0.02,
+            "各子图展示平均实际权重最高的五只 ETF，其余合并为灰色。"
+            "颜色按各子图内的权重排名分配，资产名称以图例为准。",
+            fontsize=9,
+            color="#667580",
+        )
+        fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+
+        figures[f"04_allocation_{filename}"] = fig
 
     # 第五类：调仓换手率
     figures["05_turnover"] = plot_turnover(
