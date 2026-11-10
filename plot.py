@@ -340,7 +340,11 @@ def plot_allocation(ax, strategy, result):
     ax.set_yticks([0, 0.25, 0.50, 0.75, 1])
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1))
 
-    ax.set_title(strategy)
+    title = strategy.removeprefix("动量")
+    if title == "收益约束最小方差":
+        title = "等权收益约束最小方差"
+
+    ax.set_title(title)
     format_date_axis(ax)
 
     ax.legend(
