@@ -98,21 +98,9 @@ python plot.py
 
 ### 资产配置
 
-![资产配置图 1](figures/04_allocation_1.png)
+![资产配置图 1](figures/04_allocation_full_pool.png)
 
-![资产配置图 2](figures/04_allocation_2.png)
-
-![资产配置图 3](figures/04_allocation_3.png)
-
-![资产配置图 4](figures/04_allocation_4.png)
-
-![资产配置图 5](figures/04_allocation_5.png)
-
-![资产配置图 6](figures/04_allocation_6.png)
-
-![资产配置图 7](figures/04_allocation_7.png)
-
-![资产配置图 8](figures/04_allocation_8.png)
+![资产配置图 2](figures/04_allocation_momentum.png)
 
 ### 换手率
 
