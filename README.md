@@ -54,7 +54,7 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `download_data.py` | 下载ETF行情并整理价格数据 |
+| `download_data.py` | 下载ETF行情并保存数据 |
 | `optimization.py` | 计算收益率、估计统计量并求解组合权重 |
 | `backtest.py` | 生成调仓计划、执行回测并计算绩效指标 |
 | `plot.py` | 调用回测流程，绘制并保存结果图片 |
