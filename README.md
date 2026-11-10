@@ -85,45 +85,45 @@ python plot.py
 
 ### 绩效指标
 
-![八种组合绩效指标对比](01_performance.png)
+![八种组合绩效指标对比](figures/01_performance.png)
 
 ### 组合净值
 
-![八种组合扣费后净值对比](02_nav.png)
+![八种组合扣费后净值对比](figures/02_nav.png)
 
 ### 回撤曲线
 
-![八种组合回撤对比](03_drawdown.png)
+![八种组合回撤对比](figures/03_drawdown.png)
 
 ### 资产配置
 
-![资产配置图 1](04_allocation_1.png)
+![资产配置图 1](figures/04_allocation_1.png)
 
-![资产配置图 2](04_allocation_2.png)
+![资产配置图 2](figures/04_allocation_2.png)
 
-![资产配置图 3](04_allocation_3.png)
+![资产配置图 3](figures/04_allocation_3.png)
 
-![资产配置图 4](04_allocation_4.png)
+![资产配置图 4](figures/04_allocation_4.png)
 
-![资产配置图 5](04_allocation_5.png)
+![资产配置图 5](figures/04_allocation_5.png)
 
-![资产配置图 6](04_allocation_6.png)
+![资产配置图 6](figures/04_allocation_6.png)
 
-![资产配置图 7](04_allocation_7.png)
+![资产配置图 7](figures/04_allocation_7.png)
 
-![资产配置图 8](04_allocation_8.png)
+![资产配置图 8](figures/04_allocation_8.png)
 
 ### 换手率
 
-![八种组合双边换手率对比](05_turnover.png)
+![八种组合双边换手率对比](figures/05_turnover.png)
 
 ### 资产类别暴露
 
-![八种组合的平均资产类别配置](06_asset_exposure.png)
+![八种组合的平均资产类别配置](figures/06_asset_exposure.png)
 
 ### 月度收益
 
-![全池版与动量版月度收益对比](07_monthly_returns.png)
+![全池版与动量版月度收益对比](figures/07_monthly_returns.png)
 
 ## 6. 结果分析
 
