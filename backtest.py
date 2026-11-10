@@ -146,11 +146,11 @@ def calculate_target_weights(
         mu = statistics["mean_returns"]
         covariance = statistics["covariance"]
 
-        # 用截至本期信号日的价格，选出过去 126 个交易日涨幅最高的 5 只 ETF
+        # 用截至本期信号日的价格，选出过去 252 个交易日涨幅最高的 5 只 ETF
         selected = select_momentum_etfs(
             prices=prices,
             signal_date=signal_date,
-            lookback=126,
+            lookback=252,
             top_n=5,
         )
 
