@@ -17,6 +17,7 @@ from backtest import (
     calculate_performance,
 )
 
+from lw_comparison import run_period_comparisons
 
 # ==================== 一、统一绘图设置 ====================
 
@@ -51,9 +52,12 @@ def format_date_axis(ax):
     """统一设置日期横轴和网格。"""
 
     locator = mdates.AutoDateLocator(
-        minticks=5,
-        maxticks=9,
+        minticks=3,
+        maxticks=7,
+        interval_multiples=True,
     )
+
+    locator.intervald[mdates.MONTHLY] = [1, 2, 3, 4, 6]
 
     ax.xaxis.set_major_locator(locator)
 
@@ -583,14 +587,357 @@ def plot_monthly_returns(backtest_results, strategy_colors):
     return fig
 
 
-# ==================== 九、统一绘图并保存 ====================
+# ==================== 九、稳定性部分净值图 ====================
+
+def plot_period_nav(experiments):
+    """五个独立回测区间的净值图，采用 3×2 布局。"""
+
+    styles = {
+        "等权": {"color": "#FF2020", "linestyle": "-"},
+        "最小方差": {"color": "#0066FF", "linestyle": "-"},
+        "LW最小方差": {"color": "#00CC22", "linestyle": "-"},
+    }
+
+    fig, axes = plt.subplots(
+        3, 2,
+        figsize=(16, 12),
+    )
+
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.97,
+        bottom=0.07,
+        top=0.91,
+        hspace=0.55,
+        wspace=0.22,
+    )
+
+    for ax, (year, experiment) in zip(
+        axes.flat,
+        experiments.items(),
+    ):
+
+        results = experiment["backtest_results"]
+        schedule = experiment["schedule"]
+
+        for strategy, style in styles.items():
+
+            daily = results[strategy]["每日记录"].sort_index()
+
+            ax.plot(
+                daily.index,
+                daily["净值"],
+                label=strategy,
+                linewidth=1.8,
+                **style,
+            )
+
+        # 三种组合均以建仓前净值 1 为基准
+        ax.axhline(
+            1,
+            color="#88939C",
+            linewidth=0.8,
+            alpha=0.6,
+        )
+
+        end_date = schedule["收益记录结束日"].iloc[-1]
+
+        ax.set_ylabel("净值")
+
+        format_date_axis(ax)
+        ax.set_xlabel("")
+        ax.set_title(
+            f"{year}-01 至 {end_date:%Y-%m}",
+            fontsize=11,
+            pad=8,
+        )
+
+    # 右下角专门放公共图例和说明
+    info_ax = axes[2, 1]
+    info_ax.axis("off")
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+
+    info_ax.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(0.03, 0.98),
+        borderaxespad=0,
+        labelspacing=0.8,
+        handlelength=3,
+    )
+
+    info_ax.text(
+        0.03,
+        0.32,
+        "各区间于起始年份年初独立建仓。\n"
+        "三种组合初始净值均为 1。\n"
+        "每月调仓，净值已扣除交易费用。\n"
+        "各子图纵轴独立缩放。",
+        transform=info_ax.transAxes,
+        fontsize=10,
+        color="#667580",
+        linespacing=1.6,
+        va="top",
+    )
+
+    fig.suptitle(
+        "不同回测区间的净值比较（扣费后）",
+        fontsize=plt.rcParams["axes.titlesize"],
+        y=0.97,
+    )
+
+
+    return fig
+
+
+# ==================== 十、稳定性部分回撤图 ====================
+
+def plot_period_drawdown(experiments):
+    """五个独立回测区间的回撤图，采用 3×2 布局。"""
+
+    styles = {
+        "等权": {"color": "#FF2020", "linestyle": "-"},
+        "最小方差": {"color": "#0066FF", "linestyle": "-"},
+        "LW最小方差": {"color": "#00CC22", "linestyle": "--"},
+    }
+
+    fig, axes = plt.subplots(
+        3, 2,
+        figsize=(16, 12),
+        sharey=True,
+    )
+
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.97,
+        bottom=0.07,
+        top=0.91,
+        hspace=0.55,
+        wspace=0.22,
+    )
+
+    for ax, (year, experiment) in zip(
+        axes.flat,
+        experiments.items(),
+    ):
+
+        results = experiment["backtest_results"]
+        schedule = experiment["schedule"]
+
+        for strategy, style in styles.items():
+
+            daily = results[strategy]["每日记录"].sort_index()
+            nav = daily["净值"]
+
+            # 每个独立回测区间分别计算历史最高净值
+            drawdown = nav / nav.cummax() - 1
+
+            ax.plot(
+                drawdown.index,
+                drawdown,
+                label=strategy,
+                linewidth=1.8,
+                **style,
+            )
+
+        ax.axhline(
+            0,
+            color="#88939C",
+            linewidth=0.8,
+            alpha=0.6,
+        )
+
+        end_date = schedule["收益记录结束日"].iloc[-1]
+
+        ax.set_ylabel("回撤")
+
+        ax.yaxis.set_major_formatter(
+            PercentFormatter(xmax=1.0)
+        )
+
+        format_date_axis(ax)
+        ax.set_xlabel("")
+        ax.set_title(
+            f"{year}-01 至 {end_date:%Y-%m}",
+            fontsize=11,
+            pad=8,
+        )
+
+    info_ax = axes[2, 1]
+    info_ax.axis("off")
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+
+    info_ax.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(0.03, 0.98),
+        borderaxespad=0,
+        labelspacing=0.8,
+        handlelength=3,
+    )
+
+    info_ax.text(
+        0.03,
+        0.32,
+        "回撤 = 当日净值 / 历史最高净值 − 1。\n"
+        "各区间独立建仓、独立计算回撤。\n"
+        "各子图使用相同的纵轴范围。\n"
+        "越接近 0，回撤越小。",
+        transform=info_ax.transAxes,
+        fontsize=10,
+        color="#667580",
+        linespacing=1.6,
+        va="top",
+    )
+
+    fig.suptitle(
+        "不同回测区间的回撤比较",
+        fontsize=plt.rcParams["axes.titlesize"],
+        y=0.97,
+    )
+
+
+    return fig
+
+
+# ==================== 十一、五个回测区间的绩效表 ====================
+
+def plot_period_performance_table(performance):
+    """绘制五个回测区间、三种组合的绩效汇总表。"""
+
+    strategies = ["等权", "最小方差", "LW最小方差"]
+
+    years = (
+        performance.index
+        .get_level_values("起始年份")
+        .unique()
+    )
+
+    metrics = [
+        "累计收益率",
+        "年化收益率",
+        "年化波动率",
+        "夏普比率",
+        "最大回撤",
+        "平均双边调仓换手率（不含建仓）",
+    ]
+
+    column_labels = [
+        "回测起点",
+        "组合",
+        "累计收益率",
+        "年化收益率",
+        "年化波动率",
+        "夏普比率",
+        "最大回撤",
+        "平均调仓\n双边换手率",
+    ]
+
+    rows = []
+
+    for year in years:
+        for strategy in strategies:
+
+            record = performance.loc[(year, strategy)]
+
+            values = [
+                (
+                    f"{record[metric]:.3f}"
+                    if metric == "夏普比率"
+                    else f"{record[metric]:.2%}"
+                )
+                for metric in metrics
+            ]
+
+            rows.append([
+                f"{year}-01",
+                strategy,
+                *values,
+            ])
+
+    fig, ax = plt.subplots(figsize=(11, 9))
+    ax.axis("off")
+
+    table = ax.table(
+        cellText=rows,
+        colLabels=column_labels,
+        cellLoc="center",
+        colLoc="center",
+        colWidths=[
+            0.12, 0.15, 0.12, 0.12,
+            0.12, 0.11, 0.12, 0.13,
+        ],
+        bbox=[0, 0.10, 1, 0.88],
+    )
+
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+
+    for (row, col), cell in table.get_celld().items():
+
+        cell.set_edgecolor("#DEE4E8")
+        cell.set_linewidth(0.5)
+
+        if row == 0:
+            # 表头
+            cell.set_facecolor("#466174")
+            cell.set_text_props(
+                color="white",
+                weight="bold",
+            )
+            cell.set_height(cell.get_height() * 1.5)
+
+        else:
+            # 每个区间三行，按区间交替设置底色
+            group_number = (row - 1) // len(strategies)
+
+            cell.set_facecolor(
+                "#F1F5F7"
+                if group_number % 2 == 0
+                else "white"
+            )
+
+    ax.set_title(
+        "不同回测区间的绩效比较",
+        pad=5,
+    )
+
+    fig.text(
+        0.02,
+        0.15,
+        "各区间于起始年份年初独立建仓，统一截至 2026-10-30；"
+        "收益已扣费，夏普采用 2% 年化无风险利率。",
+        fontsize=10,
+        color="#667580",
+    )
+
+    fig.text(
+        0.02,
+        0.12,
+        "平均双边调仓换手率不含首次建仓；"
+        "各区间使用相同资产池、月度调仓规则和交易费率。",
+        fontsize=10,
+        color="#667580",
+    )
+
+    fig.tight_layout(rect=[0, 0.09, 1, 0.98])
+
+    return fig
+
+
+# ==================== 十二、统一绘图并保存 ====================
 
 def plot_all(
     backtest_results,
     performance,
     output_dir,
+    period_results,
 ):
-    """生成五类图表，共12张图片。"""
+    """统一绘制、保存和显示原有实验及 LW 扩展实验的图表。"""
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -656,7 +1003,10 @@ def plot_all(
         for ax in axes[:, 0]:
             ax.set_ylabel("占总资产的权重")
 
-        fig.suptitle(f"{group_title}每日实际资产配置")
+        fig.suptitle(
+            f"{group_title}每日实际资产配置",
+            y=0.97,
+        )
         fig.text(
             0.05, 0.02,
             "各子图展示平均实际权重最高的五只 ETF，其余合并为灰色。"
@@ -664,7 +1014,7 @@ def plot_all(
             fontsize=9,
             color="#667580",
         )
-        fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+        fig.tight_layout(rect=[0, 0.06, 1, 0.98])
 
         figures[f"04_allocation_{filename}"] = fig
 
@@ -685,6 +1035,19 @@ def plot_all(
         strategy_colors,
     )
 
+    # LW 扩展实验：五个回测区间的绩效表、净值和回撤
+    figures["lw_01_performance"] = plot_period_performance_table(
+        period_results["performance"]
+    )
+
+    figures["lw_02_nav"] = plot_period_nav(
+        period_results["experiments"]
+    )
+
+    figures["lw_03_drawdown"] = plot_period_drawdown(
+        period_results["experiments"]
+    )
+
     # 保存图片
     for filename, fig in figures.items():
 
@@ -699,7 +1062,7 @@ def plot_all(
     plt.show()
 
 
-# ==================== 十、运行入口 ====================
+# ==================== 十三、运行入口 ====================
 
 if __name__ == "__main__":
 
@@ -742,9 +1105,35 @@ if __name__ == "__main__":
         annual_risk_free_rate=0.02,
     )
 
-    # 绘制、保存并显示全部图表
+    # ==================== LW 扩展实验 ====================
+
+    # 复制价格表，原有实验仍使用原始数据
+    comparison_prices = prices.copy()
+
+    # 以前一交易日价格填补两个已确认的历史缺口
+    comparison_prices.loc["2022-01-13", "纳斯达克100"] = (
+        comparison_prices.loc["2022-01-12", "纳斯达克100"]
+    )
+
+    comparison_prices.loc["2025-01-23", "德国DAX"] = (
+        comparison_prices.loc["2025-01-22", "德国DAX"]
+    )
+
+    # 五个起点分别独立回测
+    period_results = run_period_comparisons(
+        prices=comparison_prices,
+        start_years=[2022, 2023, 2024, 2025, 2026],
+        last_signal_month="2026-09",
+        backtest_end="2026-10-30",
+        initial_capital=100000.0,
+        fee_rate=0.0005,
+        annual_risk_free_rate=0.02,
+    )
+
+    # 所有回测完成后，再统一绘图、保存和显示
     plot_all(
         backtest_results=backtest_results,
         performance=performance,
         output_dir=project_dir / "figures",
+        period_results=period_results,
     )
