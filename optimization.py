@@ -1,16 +1,31 @@
+"""
+基于 ETF 总回报指数的收益估计、动量筛选与组合优化。
+
+输入 etf_total_return.csv；现金分红及份额折算已在数据模块中处理，
+本模块不重复叠加分红。动量默认采用252个交易日窗口。
+日收益仅在相邻市场交易行均有有效指数时计算；缺报价日及其后一行
+不进入该资产的日频统计，不将跨多日收益当作单日收益，不插值或回填。
+各资产及资产对保留各自有效样本，协方差的既有半正定修正规则不变。
+"""
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
 
 def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """将价格表转换为简单日收益率表。"""
+    """
+    将总回报指数转换为简单日收益率，保留缺失值。
+
+    prices 参数名保留兼容现有调用；输入应为 TRI，而非不复权价格。
+    缺报价及其后的跨缺口区间不参与日频估计；完整累计回报仍由 TRI 表示。
+    """
 
     if not isinstance(prices.index, pd.DatetimeIndex):
         raise ValueError("价格表必须使用日期索引")
 
-    if prices.index.has_duplicates:
-        raise ValueError("价格表存在重复日期")
+    if prices.index.hasnans or prices.index.has_duplicates:
+        raise ValueError("指数表存在无效或重复日期")
 
     if prices.columns.has_duplicates:
         raise ValueError("价格表存在重复的 ETF 列名")
@@ -18,10 +33,13 @@ def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
     if len(prices) < 2 or prices.shape[1] == 0:
         raise ValueError("价格表至少需要两行数据和一只 ETF")
 
-    # 按日期从早到晚排序
     prices = prices.sort_index()
+    values = prices.to_numpy(dtype=float)
+    if np.isinf(values).any() or (values[~np.isnan(values)] <= 0).any():
+        raise ValueError("有效总回报指数必须为有限正数")
 
-    # 当天收益率 = 当天价格 / 前一天价格 - 1
+    # 不填补缺失指数：缺报价及其后的跨缺口收益均保留为空。
+    # 相邻有效交易行的日收益 = TRI_t / TRI_(t-1) - 1。
     returns = prices.pct_change(fill_method=None)
 
     # 第一行没有前一天价格，无法计算收益率
@@ -393,18 +411,28 @@ def risk_parity(covariance: pd.DataFrame) -> pd.Series:
 def select_momentum_etfs(
     prices: pd.DataFrame,
     signal_date: str,
-    lookback: int = 126,
+    lookback: int = 252,
     top_n: int = 5,
 ) -> pd.Index:
-    """按截至信号日的累计涨幅排名，返回前 top_n 只 ETF。"""
-    # 只使用信号日及之前的价格，取最后 127 行对应 126 个收益区间。
+    """按截至信号日的 TRI 累计回报排名，返回前 top_n 只 ETF。"""
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise ValueError("指数表必须使用日期索引")
+    if prices.index.hasnans or prices.index.has_duplicates or prices.columns.has_duplicates:
+        raise ValueError("指数表存在无效日期、重复日期或重复资产")
+    if isinstance(lookback, bool) or not isinstance(lookback, (int, np.integer)) or lookback <= 0:
+        raise ValueError("动量窗口必须为正整数")
+    if isinstance(top_n, bool) or not isinstance(top_n, (int, np.integer)) or top_n <= 0:
+        raise ValueError("入选数量必须为正整数")
+    if pd.isna(pd.Timestamp(signal_date)):
+        raise ValueError("信号日期不能为空")
+    # 仅使用信号日及之前的指数，lookback 个收益区间对应 lookback+1 行。
     history = prices.sort_index().loc[:pd.Timestamp(signal_date)]
     window = history.tail(lookback + 1)
 
     if len(window) < lookback + 1:
         raise ValueError(f"动量排名至少需要 {lookback + 1} 个交易日的价格")
 
-    # 所有 ETF 使用相同的起止日期。
+    # 所有 ETF 使用相同起止日期；区间中间的缺报价不改变已知端点累计回报。
     start_prices = window.iloc[0]
     end_prices = window.iloc[-1]
 
@@ -429,10 +457,10 @@ def select_momentum_etfs(
 if __name__ == "__main__":
     from pathlib import Path
 
-    # 读取与 optimization.py 放在同一文件夹的价格表
+    # 读取已计入分红再投资和份额折算的总回报指数。
     project_dir = Path(__file__).resolve().parent
     prices = pd.read_csv(
-        project_dir / "etf_prices.csv",
+        project_dir / "etf_total_return.csv",
         index_col="Date",
         parse_dates=["Date"],
         encoding="utf-8-sig",
@@ -447,11 +475,11 @@ if __name__ == "__main__":
     mu = statistics["mean_returns"]
     covariance = statistics["covariance"]
 
-    # 用最近 126 个交易日的涨幅选出前 5 只。
+    # 按最近252个交易日的总回报选取前5只。
     selected = select_momentum_etfs(
         prices,
         signal_date=signal_date,
-        lookback=126,
+        lookback=252,
         top_n=5,
     )
 
@@ -459,7 +487,7 @@ if __name__ == "__main__":
     selected_mu = mu.loc[selected]
     selected_covariance = covariance.loc[selected, selected]
 
-    # 原来的四种组合用全池，动量版的四种组合用同一份入选名单。
+    # 全池四种组合使用全部资产，动量四种组合使用相同入选名单。
     weights = pd.DataFrame({
         "等权": equal_weight(mu.index),
         "最小方差": min_variance(covariance),
@@ -505,7 +533,7 @@ if __name__ == "__main__":
     print("\n历史参数下的组合比较：")
     print(comparison.to_string(float_format=lambda x: f"{x:.8f}"))
 
-    # 先算出风险贡献占比，再在下面的 checks 中使用它
+    # 验证等风险贡献条件。
     rp_weights = weights["风险平价"].to_numpy()
     risk_contributions = rp_weights * (sigma @ rp_weights)
     risk_shares = risk_contributions / risk_contributions.sum()

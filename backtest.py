@@ -1,5 +1,16 @@
+"""
+基于 ETF 总回报指数的月度组合回测。
+
+prices 参数统一接收 TRI；分红再投资和份额折算已由数据模块处理，
+本模块不再额外计入现金分红。持有份额为 TRI 模拟单位，不是实际 ETF 份额。
+固定模拟单位使各资产持仓价值随 TRI 变化，代表分红无成本再投资的研究口径。
+信号在月末收盘生成，下一交易日收盘执行；执行日涨跌由旧持仓承担。
+按实际调仓市值收取单边比例费用，红利再投资费用及到账延迟按 TRI 假设忽略。
+持仓估值或交易所需的指数缺失时显式报错，不自动填补，也不按零估值。
+"""
+
 import pandas as pd
-#从optimization.py中导入已经定义好的7个函数
+# 收益估计、动量筛选与权重计算均使用同一 TRI 数据口径。
 from optimization import (
     calculate_returns,
     estimate_statistics,
@@ -19,7 +30,7 @@ def make_rebalance_schedule(
     last_signal_month: str = "2026-09",
     backtest_end: str = "2026-10-30",
 ) -> pd.DataFrame:
-    """生成扩展窗口、月度调仓计划。"""
+    """依据 TRI 的市场交易日期生成扩展窗口月度调仓计划。"""
 
     # 检查日期索引
     if not isinstance(prices.index, pd.DatetimeIndex):
@@ -120,7 +131,11 @@ def calculate_target_weights(
     schedule: pd.DataFrame,
     prices: pd.DataFrame,
 ) -> dict:
-    """按照调仓计划，计算每一期八种组合的目标权重。"""
+    """
+    根据各信号日及之前的 TRI 日收益计算八种组合目标权重。
+
+    returns 应由同一份 prices 经 calculate_returns() 生成。
+    """
 
     # 创建空字典，用来保存每一期的计算结果
     results = {}
@@ -146,7 +161,7 @@ def calculate_target_weights(
         mu = statistics["mean_returns"]
         covariance = statistics["covariance"]
 
-        # 用截至本期信号日的价格，选出过去 252 个交易日涨幅最高的 5 只 ETF
+        # 按截至信号日的252个交易日总回报，选取前5只 ETF。
         selected = select_momentum_etfs(
             prices=prices,
             signal_date=signal_date,
@@ -193,16 +208,35 @@ def execute_rebalance(
     target_weights: pd.Series,
     fee_rate: float = 0.0005,
 ) -> dict:
-    """单词减仓/调仓的函数：按目标权重完成一次调仓，费用从现有资产中扣除。"""
+    """
+    按目标权重调仓，以二分法求解扣费后的可配置金额。
 
-    # 1. 按目标权重中的ETF顺序对齐数据
+    current_shares 与返回份额均为 TRI 模拟单位；prices 为当日 TRI。
+    交易费用按资产市值变动计算，不按指数点数或模拟单位数量计算。
+    """
+
+    # 1. 按目标权重中的 ETF 顺序对齐数据。
     assets = target_weights.index
+    if len(assets) == 0 or assets.has_duplicates:
+        raise ValueError("目标资产必须非空且不能重复")
+    if current_shares.index.has_duplicates or prices.index.has_duplicates:
+        raise ValueError("持仓或当日指数存在重复资产")
+    omitted = current_shares.loc[~current_shares.index.isin(assets)]
+    if omitted.ne(0).any():
+        raise ValueError("目标权重遗漏已有持仓资产")
 
     shares = current_shares.reindex(assets)
     prices = prices.reindex(assets)
     weights = target_weights.copy()
 
-    if not 0 <= fee_rate < 1:
+    if not np.isfinite(cash) or cash < 0:
+        raise ValueError("现金必须为有限非负数")
+    if not np.isfinite(shares.to_numpy(dtype=float)).all() or shares.lt(0).any():
+        raise ValueError("持仓模拟单位必须为有限非负数且覆盖目标资产")
+    if not np.isfinite(weights.to_numpy(dtype=float)).all():
+        raise ValueError("目标权重必须为有限数")
+
+    if not np.isfinite(fee_rate) or not 0 <= fee_rate < 1:
         raise ValueError("费率必须满足0 <= fee_rate < 1")
 
     if (
@@ -220,10 +254,12 @@ def execute_rebalance(
     invalid = required & (~np.isfinite(prices) | prices.le(0))
     if invalid.any():
         names = "、".join(prices.index[invalid])
-        raise ValueError(f"调仓时缺少有效收盘价：{names}")
+        raise ValueError(f"调仓时缺少有效 TRI：{names}")
 
     old_values = shares * prices.where(shares.ne(0), 0.0)
     value_before = float(old_values.sum() + cash)
+    if not np.isfinite(value_before) or value_before <= 0:
+        raise ValueError("调仓前总资产必须为有限正数")
 
     # 金额容差，单位为元
     tolerance = max(1e-8, 1e-10 * value_before)
@@ -311,12 +347,28 @@ def run_backtest(
     initial_capital: float = 100000.0,
     fee_rate: float = 0.0005,
 ) -> dict:
-    """按调仓计划进行每日回测，返回各组合的每日与交易记录。"""
+    """
+    以固定 TRI 模拟单位记录调仓间持仓，返回逐日估值与交易记录。
 
-    if initial_capital <= 0:
+    分红收益已包含于 TRI；执行日先对旧持仓估值，再调仓并扣费。
+    为兼容既有绘图接口，输出键“持有份额”保留，其含义为模拟指数单位。
+    """
+
+    if not np.isfinite(initial_capital) or initial_capital <= 0:
         raise ValueError("初始资金必须为正")
 
-    # 按时间排序，避免日期顺序影响回测
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise ValueError("TRI 表必须使用日期索引")
+    if prices.empty or prices.index.hasnans or prices.index.has_duplicates:
+        raise ValueError("TRI 表为空或存在无效、重复日期")
+    if prices.columns.has_duplicates:
+        raise ValueError("TRI 表存在重复资产")
+    if schedule.empty or schedule["执行日"].duplicated().any():
+        raise ValueError("调仓计划为空或存在重复执行日期")
+    if not np.isfinite(fee_rate) or not 0 <= fee_rate < 1:
+        raise ValueError("费率必须满足 0 <= fee_rate < 1")
+
+    # 按时间排序，避免日期顺序影响回测。
     prices = prices.sort_index()
     schedule = schedule.sort_values("执行日")
 
@@ -325,6 +377,14 @@ def run_backtest(
     end_date = schedule["收益记录结束日"].iloc[-1]
 
     backtest_prices = prices.loc[start_date:end_date]
+    required_dates = pd.Index([start_date, end_date]).append(
+        pd.Index(schedule["执行日"])
+    )
+    if not required_dates.isin(prices.index).all():
+        raise ValueError("TRI 表缺少回测基准日、结束日或执行日")
+    for date in schedule["执行日"]:
+        if date not in target_weights:
+            raise ValueError(f"{date:%Y-%m-%d} 缺少目标权重")
 
     # 所有ETF名称
     assets = prices.columns
@@ -341,10 +401,10 @@ def run_backtest(
     # 保存八种组合各自的回测结果
     results = {}
 
-    # 八种组合分别回测
+    # 各组合分别回测
     for strategy in strategy_names:
 
-        # 初始状态：没有ETF持仓，全部资金为现金
+        # 初始状态：模拟指数单位为零，全部资金为现金。
         shares = pd.Series(0.0, index=assets)
         cash = float(initial_capital)
 
@@ -359,12 +419,12 @@ def run_backtest(
         # 按交易日依次模拟
         for date, daily_prices in backtest_prices.iterrows():
 
-            # 1. 先按当天收盘价计算旧持仓市值
+            # 1. 先按当日 TRI 对旧持仓估值，收益包含已计入指数的分红再投资。
             held = shares.ne(0)
             invalid = held & (~np.isfinite(daily_prices) | daily_prices.le(0))
             if invalid.any():
                 names = "、".join(daily_prices.index[invalid])
-                raise ValueError(f"{date:%Y-%m-%d} {strategy} 持仓缺少有效收盘价：{names}")
+                raise ValueError(f"{date:%Y-%m-%d} {strategy} 持仓缺少有效 TRI：{names}")
 
             holding_values = shares * daily_prices.where(held, 0.0)
             value_before = float(holding_values.sum() + cash)
@@ -430,7 +490,7 @@ def run_backtest(
                 "交易费用": daily_fee,
             })
 
-            # 保存当天收盘后的份额和实际权重
+            # 保存收盘后的 TRI 模拟单位及按持仓市值计算的实际权重。
             share_records.append(shares.copy())
             weight_records.append(
                 holding_values / total_value
@@ -589,10 +649,10 @@ def calculate_performance(
 if __name__ == "__main__":
     from pathlib import Path
 
-    # 读取与 backtest.py 放在同一文件夹中的价格表
+    # 读取与参数估计及动量筛选相同的总回报指数。
     project_dir = Path(__file__).resolve().parent
     prices = pd.read_csv(
-        project_dir / "etf_prices.csv",
+        project_dir / "etf_total_return.csv",
         index_col="Date",
         parse_dates=["Date"],
         encoding="utf-8-sig",

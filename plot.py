@@ -1,3 +1,11 @@
+"""
+ETF 组合回测与 LW 扩展实验的统一绘图入口。
+
+参数估计、动量筛选与组合估值统一使用 etf_total_return.csv。
+分红再投资及份额折算已计入 TRI；停牌估值由 LW 实验模块局部处理，
+绘图入口不修改或填补参数估计输入。所有图表收益均包含调仓费用。
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +15,8 @@ import matplotlib.dates as mdates
 
 from matplotlib.ticker import PercentFormatter
 from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.patches import Rectangle
 
 from optimization import calculate_returns
 
@@ -25,6 +35,8 @@ from lw_comparison import run_period_comparisons
 plt.rcParams["font.sans-serif"] = [
     "Microsoft YaHei",
     "SimHei",
+    "Noto Sans CJK SC",
+    "Noto Sans CJK JP",
     "DejaVu Sans",
 ]
 
@@ -220,7 +232,7 @@ def plot_nav(backtest_results, strategy_colors):
         linewidth=0.9,
     )
 
-    ax.set_title("八种组合的净值比较（扣费后）")
+    ax.set_title("八种组合的净值比较（含分红再投资，扣费后）")
     ax.set_ylabel("净值（初始资金 = 1）")
 
     format_date_axis(ax)
@@ -582,234 +594,107 @@ def plot_monthly_returns(backtest_results, strategy_colors):
     for ax in axes[-1]:
         ax.set_xticks(x, month_labels, rotation=30, ha="right")
 
-    fig.suptitle("各组合的月度收益比较（扣费后）")
+    fig.suptitle("各组合的月度收益比较（含分红再投资，扣费后）")
     fig.tight_layout()
     return fig
 
 
-# ==================== 九、稳定性部分净值图 ====================
+# ==================== 九、LW 扩展实验收益贡献 ====================
 
-def plot_period_nav(experiments):
-    """五个独立回测区间的净值图，采用 3×2 布局。"""
+def calculate_period_return_contributions(experiments, prices):
+    """
+    按前一日持仓模拟单位计算各资产累计盈亏贡献，单位为百分点。
 
-    styles = {
-        "等权": {"color": "#FF2020", "linestyle": "-"},
-        "最小方差": {"color": "#0066FF", "linestyle": "-"},
-        "LW最小方差": {"color": "#00CC22", "linestyle": "-"},
+    每列资产贡献与费用贡献之和必须等于组合累计收益率。
+    不使用平均权重乘以区间收益，也不将各日收益率直接相加。
+    """
+    strategies = [
+        "等权", "最小方差", "LW最小方差",
+        "等权收益约束最小方差", "等权收益约束LW最小方差",
+    ]
+    asset_groups = {
+        "A股": ["沪深300", "中证500", "创业板", "上证红利"],
+        "港股": ["恒生ETF"],
+        "美股": ["纳斯达克100"],
+        "欧股": ["德国DAX"],
+        "国债": ["5年期国债"],
+        "城投债": ["城投债"],
+        "黄金": ["黄金ETF"],
     }
-
-    fig, axes = plt.subplots(
-        3, 2,
-        figsize=(16, 12),
-    )
-
-    fig.subplots_adjust(
-        left=0.08,
-        right=0.97,
-        bottom=0.07,
-        top=0.91,
-        hspace=0.55,
-        wspace=0.22,
-    )
-
-    for ax, (year, experiment) in zip(
-        axes.flat,
-        experiments.items(),
+    valuation_prices = prices.sort_index().copy()
+    # 与 LW 回测保持一致：这两个已确认停牌日仅沿用上一 TRI 估值。
+    for name, date_text in (
+        ("纳斯达克100", "2022-01-13"),
+        ("德国DAX", "2025-01-23"),
     ):
+        date = pd.Timestamp(date_text)
+        if name in valuation_prices.columns and date in valuation_prices.index:
+            if pd.isna(valuation_prices.loc[date, name]):
+                position = valuation_prices.index.get_loc(date)
+                if position == 0:
+                    raise ValueError(f"{name} 停牌日前无有效 TRI")
+                previous = valuation_prices[name].iloc[position - 1]
+                if not np.isfinite(previous) or previous <= 0:
+                    raise ValueError(f"{name} 停牌日前缺少有效 TRI")
+                valuation_prices.loc[date, name] = previous
 
+    records = {}
+    for year, experiment in experiments.items():
         results = experiment["backtest_results"]
-        schedule = experiment["schedule"]
+        for strategy in strategies:
+            if strategy not in results:
+                raise ValueError(f"LW 回测缺少组合：{strategy}")
+            result = results[strategy]
+            daily = result["每日记录"].sort_index()
+            shares = result["持有份额"].reindex(daily.index)
+            if shares.isna().any().any() or shares.iloc[0].ne(0).any():
+                raise ValueError("贡献计算要求完整持仓记录及建仓前现金基准")
+            initial_capital = float(daily["总资产"].iloc[0])
+            if not np.isfinite(initial_capital) or initial_capital <= 0:
+                raise ValueError("贡献计算的初始资金无效")
 
-        for strategy, style in styles.items():
-
-            daily = results[strategy]["每日记录"].sort_index()
-
-            ax.plot(
-                daily.index,
-                daily["净值"],
-                label=strategy,
-                linewidth=1.8,
-                **style,
+            # 执行日的价格变动由旧持仓承担，调仓在收盘时完成。
+            previous_shares = shares.shift(1).fillna(0.0)
+            changes = valuation_prices.reindex(
+                index=daily.index, columns=shares.columns
+            ).diff()
+            daily_pnl = (previous_shares * changes).where(
+                previous_shares.ne(0), 0.0
             )
-
-        # 三种组合均以建仓前净值 1 为基准
-        ax.axhline(
-            1,
-            color="#88939C",
-            linewidth=0.8,
-            alpha=0.6,
-        )
-
-        end_date = schedule["收益记录结束日"].iloc[-1]
-
-        ax.set_ylabel("净值")
-
-        format_date_axis(ax)
-        ax.set_xlabel("")
-        ax.set_title(
-            f"{year}-01 至 {end_date:%Y-%m}",
-            fontsize=11,
-            pad=8,
-        )
-
-    # 右下角专门放公共图例和说明
-    info_ax = axes[2, 1]
-    info_ax.axis("off")
-
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-
-    info_ax.legend(
-        handles,
-        labels,
-        loc="upper left",
-        bbox_to_anchor=(0.03, 0.98),
-        borderaxespad=0,
-        labelspacing=0.8,
-        handlelength=3,
-    )
-
-    info_ax.text(
-        0.03,
-        0.32,
-        "各区间于起始年份年初独立建仓。\n"
-        "三种组合初始净值均为 1。\n"
-        "每月调仓，净值已扣除交易费用。\n"
-        "各子图纵轴独立缩放。",
-        transform=info_ax.transAxes,
-        fontsize=10,
-        color="#667580",
-        linespacing=1.6,
-        va="top",
-    )
-
-    fig.suptitle(
-        "不同回测区间的净值比较（扣费后）",
-        fontsize=plt.rcParams["axes.titlesize"],
-        y=0.97,
-    )
-
-
-    return fig
-
-
-# ==================== 十、稳定性部分回撤图 ====================
-
-def plot_period_drawdown(experiments):
-    """五个独立回测区间的回撤图，采用 3×2 布局。"""
-
-    styles = {
-        "等权": {"color": "#FF2020", "linestyle": "-"},
-        "最小方差": {"color": "#0066FF", "linestyle": "-"},
-        "LW最小方差": {"color": "#00CC22", "linestyle": "--"},
-    }
-
-    fig, axes = plt.subplots(
-        3, 2,
-        figsize=(16, 12),
-        sharey=True,
-    )
-
-    fig.subplots_adjust(
-        left=0.08,
-        right=0.97,
-        bottom=0.07,
-        top=0.91,
-        hspace=0.55,
-        wspace=0.22,
-    )
-
-    for ax, (year, experiment) in zip(
-        axes.flat,
-        experiments.items(),
-    ):
-
-        results = experiment["backtest_results"]
-        schedule = experiment["schedule"]
-
-        for strategy, style in styles.items():
-
-            daily = results[strategy]["每日记录"].sort_index()
-            nav = daily["净值"]
-
-            # 每个独立回测区间分别计算历史最高净值
-            drawdown = nav / nav.cummax() - 1
-
-            ax.plot(
-                drawdown.index,
-                drawdown,
-                label=strategy,
-                linewidth=1.8,
-                **style,
+            if not np.isfinite(daily_pnl.to_numpy()).all():
+                raise ValueError(f"{year} {strategy} 持仓收益缺少有效指数")
+            asset_pnl = daily_pnl.sum()
+            record = {
+                category: float(asset_pnl.loc[assets].sum() / initial_capital * 100)
+                for category, assets in asset_groups.items()
+            }
+            record["交易费用"] = -float(
+                daily["交易费用"].sum() / initial_capital * 100
             )
+            net_return = float(
+                (daily["总资产"].iloc[-1] / initial_capital - 1) * 100
+            )
+            if not np.isclose(sum(record.values()), net_return, rtol=1e-10, atol=1e-8):
+                raise ValueError(f"{year} {strategy} 的贡献合计与累计收益率不一致")
+            record["累计收益率"] = net_return
+            records[(year, strategy)] = record
 
-        ax.axhline(
-            0,
-            color="#88939C",
-            linewidth=0.8,
-            alpha=0.6,
-        )
-
-        end_date = schedule["收益记录结束日"].iloc[-1]
-
-        ax.set_ylabel("回撤")
-
-        ax.yaxis.set_major_formatter(
-            PercentFormatter(xmax=1.0)
-        )
-
-        format_date_axis(ax)
-        ax.set_xlabel("")
-        ax.set_title(
-            f"{year}-01 至 {end_date:%Y-%m}",
-            fontsize=11,
-            pad=8,
-        )
-
-    info_ax = axes[2, 1]
-    info_ax.axis("off")
-
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-
-    info_ax.legend(
-        handles,
-        labels,
-        loc="upper left",
-        bbox_to_anchor=(0.03, 0.98),
-        borderaxespad=0,
-        labelspacing=0.8,
-        handlelength=3,
+    contributions = pd.DataFrame.from_dict(records, orient="index")
+    contributions.index = pd.MultiIndex.from_tuples(
+        contributions.index, names=["起始年份", "组合"]
     )
-
-    info_ax.text(
-        0.03,
-        0.32,
-        "回撤 = 当日净值 / 历史最高净值 − 1。\n"
-        "各区间独立建仓、独立计算回撤。\n"
-        "各子图使用相同的纵轴范围。\n"
-        "越接近 0，回撤越小。",
-        transform=info_ax.transAxes,
-        fontsize=10,
-        color="#667580",
-        linespacing=1.6,
-        va="top",
-    )
-
-    fig.suptitle(
-        "不同回测区间的回撤比较",
-        fontsize=plt.rcParams["axes.titlesize"],
-        y=0.97,
-    )
+    return contributions
 
 
-    return fig
-
-
-# ==================== 十一、五个回测区间的绩效表 ====================
+# ==================== 十、五个回测区间的绩效表 ====================
 
 def plot_period_performance_table(performance):
-    """绘制五个回测区间、三种组合的绩效汇总表。"""
+    """绘制五个回测区间、五种组合的绩效汇总表。"""
 
-    strategies = ["等权", "最小方差", "LW最小方差"]
+    strategies = [
+        "等权", "最小方差", "LW最小方差",
+        "等权收益约束最小方差", "等权收益约束LW最小方差",
+    ]
 
     years = (
         performance.index
@@ -855,11 +740,15 @@ def plot_period_performance_table(performance):
 
             rows.append([
                 f"{year}-01",
-                strategy,
+                strategy.replace(
+                    "等权收益约束LW最小方差", "等权收益约束\nLW最小方差"
+                ).replace(
+                    "等权收益约束最小方差", "等权收益约束\n最小方差"
+                ),
                 *values,
             ])
 
-    fig, ax = plt.subplots(figsize=(11, 9))
+    fig, ax = plt.subplots(figsize=(13, 15))
     ax.axis("off")
 
     table = ax.table(
@@ -868,8 +757,8 @@ def plot_period_performance_table(performance):
         cellLoc="center",
         colLoc="center",
         colWidths=[
-            0.12, 0.15, 0.12, 0.12,
-            0.12, 0.11, 0.12, 0.13,
+            0.09, 0.25, 0.11, 0.11,
+            0.11, 0.09, 0.11, 0.13,
         ],
         bbox=[0, 0.10, 1, 0.88],
     )
@@ -892,7 +781,7 @@ def plot_period_performance_table(performance):
             cell.set_height(cell.get_height() * 1.5)
 
         else:
-            # 每个区间三行，按区间交替设置底色
+            # 每个区间五行，按区间交替设置底色。
             group_number = (row - 1) // len(strategies)
 
             cell.set_facecolor(
@@ -910,7 +799,7 @@ def plot_period_performance_table(performance):
         0.02,
         0.15,
         "各区间于起始年份年初独立建仓，统一截至 2026-10-30；"
-        "收益已扣费，夏普采用 2% 年化无风险利率。",
+        "收益含分红再投资并扣除调仓费，夏普采用 2% 年化无风险利率。",
         fontsize=10,
         color="#667580",
     )
@@ -919,13 +808,116 @@ def plot_period_performance_table(performance):
         0.02,
         0.12,
         "平均双边调仓换手率不含首次建仓；"
-        "各区间使用相同资产池、月度调仓规则和交易费率。",
+        "参数估计采用相同完整共同样本，资产池、调仓规则及费率一致。",
         fontsize=10,
         color="#667580",
     )
 
     fig.tight_layout(rect=[0, 0.09, 1, 0.98])
 
+    return fig
+
+
+# ==================== 十一、五个区间各组合的累计收益贡献热力图 ====================
+
+def plot_period_return_contribution(experiments, prices):
+    """绘制五个区间、五种组合的累计收益贡献热力图，正红负绿。"""
+    contributions = calculate_period_return_contributions(experiments, prices)
+    strategies = [
+        "等权", "最小方差", "LW最小方差",
+        "等权收益约束最小方差", "等权收益约束LW最小方差",
+    ]
+    labels = [
+        "等权", "最小方差", "LW最小方差",
+        "等权收益约束\n最小方差", "等权收益约束\nLW最小方差",
+    ]
+    category_colors = {
+        "A股": "#00BFFF", "港股": "#FF2020",
+        "美股": "#0066FF", "欧股": "#FF7700",
+        "国债": "#00CC22", "城投债": "#00CC22",
+        "黄金": "#FFE34D", "交易费用": "#9AA3AA",
+    }
+    years = list(experiments)
+    order = pd.MultiIndex.from_product(
+        [years, strategies], names=["起始年份", "组合"]
+    )
+    contributions = contributions.reindex(order)
+    categories = list(category_colors)
+    values = contributions[categories].to_numpy().T
+    net_returns = contributions["累计收益率"].to_numpy()
+    limit = max(float(np.abs(values).max()), 1e-12)
+    cmap = LinearSegmentedColormap.from_list(
+        "return_contribution", ["#00CC22", "#FFFFFF", "#FF2020"]
+    )
+    cmap.set_bad("#F1F5F7")
+    # 最后一行单列累计收益率，不参与资产贡献的颜色尺度。
+    display_values = np.vstack([values, np.full(len(order), np.nan)])
+
+    fig, ax = plt.subplots(figsize=(24, 9))
+    fig.subplots_adjust(left=0.09, right=0.94, bottom=0.23, top=0.86)
+    image = ax.imshow(
+        display_values, aspect="auto", cmap=cmap,
+        norm=TwoSlopeNorm(vmin=-limit, vcenter=0, vmax=limit),
+    )
+    for row in range(len(categories) + 1):
+        for column in range(len(order)):
+            value = values[row, column] if row < len(categories) else net_returns[column]
+            text = "0.00" if abs(value) < 0.005 else f"{value:+.2f}"
+            color = (
+                "white" if row < len(categories) and abs(value) > 0.6 * limit
+                else "#233847"
+            )
+            ax.text(
+                column, row, text, ha="center", va="center",
+                fontsize=8.5, color=color,
+                fontweight="bold" if row == len(categories) else "normal",
+            )
+
+    # 行标签色条沿用资产类别颜色；两只债券以纹理区分。
+    for row, category in enumerate(categories):
+        ax.add_patch(Rectangle(
+            (-0.85, row - 0.43), 0.15, 0.86,
+            facecolor=category_colors[category], edgecolor="white",
+            hatch="///" if category == "城投债" else None, clip_on=False,
+        ))
+    ax.set_yticks(
+        range(len(categories) + 1), categories + ["累计收益率（%）"], fontsize=11
+    )
+    ax.tick_params(axis="y", pad=26)
+    ax.set_xticks(range(len(order)), labels * len(years), fontsize=8.5)
+    ax.set_xticks(np.arange(-0.5, len(order), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(categories) + 1, 1), minor=True)
+    ax.grid(which="minor", color="#DEE4E8", linewidth=0.5)
+    ax.tick_params(which="minor", length=0)
+    for boundary in range(5, len(order), 5):
+        ax.axvline(boundary - 0.5, color="#466174", linewidth=1.5)
+    ax.axhline(len(categories) - 0.5, color="#466174", linewidth=1.2)
+
+    top_axis = ax.secondary_xaxis("top")
+    end_dates = [
+        experiments[year]["schedule"]["收益记录结束日"].iloc[-1]
+        for year in years
+    ]
+    top_axis.set_xticks(
+        [i * 5 + 2 for i in range(len(years))],
+        [f"{year}-01 至 {end:%Y-%m}" for year, end in zip(years, end_dates)],
+        fontsize=12,
+    )
+    top_axis.tick_params(length=0, pad=12)
+    top_axis.spines["top"].set_visible(False)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.018, pad=0.02)
+    colorbar.set_label("收益贡献（百分点）")
+    fig.suptitle("各组合累计收益的资产贡献", y=0.98, fontsize=18)
+    fig.text(
+        0.09, 0.065,
+        "红色为正贡献，绿色为负贡献；标签色条表示资产类别。末行是累计收益率（%），不参与色阶。",
+        fontsize=10, color="#667580",
+    )
+    fig.text(
+        0.09, 0.025,
+        "每列资产贡献加费用贡献等于累计收益率；按实际持仓逐日盈亏累计。各区间长度不同，贡献为累计值。",
+        fontsize=10, color="#667580",
+    )
     return fig
 
 
@@ -936,6 +928,7 @@ def plot_all(
     performance,
     output_dir,
     period_results,
+    prices,
 ):
     """统一绘制、保存和显示原有实验及 LW 扩展实验的图表。"""
 
@@ -1035,17 +1028,12 @@ def plot_all(
         strategy_colors,
     )
 
-    # LW 扩展实验：五个回测区间的绩效表、净值和回撤
+    # LW 扩展实验：绩效表与累计收益贡献热力图。
     figures["lw_01_performance"] = plot_period_performance_table(
         period_results["performance"]
     )
-
-    figures["lw_02_nav"] = plot_period_nav(
-        period_results["experiments"]
-    )
-
-    figures["lw_03_drawdown"] = plot_period_drawdown(
-        period_results["experiments"]
+    figures["lw_02_return_contribution"] = plot_period_return_contribution(
+        period_results["experiments"], prices
     )
 
     # 保存图片
@@ -1055,6 +1043,10 @@ def plot_all(
             output_dir / f"{filename}.png",
             bbox_inches="tight",
         )
+
+    # 清理本脚本旧版本生成、现已取消的两张 LW 曲线图。
+    for filename in ("lw_02_nav.png", "lw_03_drawdown.png", "lw_02_asset_exposure.png"):
+        (output_dir / filename).unlink(missing_ok=True)
 
     print(f"\n图片已保存到：{output_dir.resolve()}")
 
@@ -1069,9 +1061,9 @@ if __name__ == "__main__":
     # 当前文件所在目录
     project_dir = Path(__file__).resolve().parent
 
-    # 读取已经下载好的价格数据
+    # 读取包含现金分红再投资和份额折算的总回报指数。
     prices = pd.read_csv(
-        project_dir / "etf_prices.csv",
+        project_dir / "etf_total_return.csv",
         index_col="Date",
         parse_dates=["Date"],
         encoding="utf-8-sig",
@@ -1107,21 +1099,11 @@ if __name__ == "__main__":
 
     # ==================== LW 扩展实验 ====================
 
-    # 复制价格表，原有实验仍使用原始数据
-    comparison_prices = prices.copy()
-
-    # 以前一交易日价格填补两个已确认的历史缺口
-    comparison_prices.loc["2022-01-13", "纳斯达克100"] = (
-        comparison_prices.loc["2022-01-12", "纳斯达克100"]
-    )
-
-    comparison_prices.loc["2025-01-23", "德国DAX"] = (
-        comparison_prices.loc["2025-01-22", "德国DAX"]
-    )
-
+    # 与八组合实验使用同一份原始 TRI。
+    # 已确认停牌日的估值处理由 LW 模块负责，不改变参数估计样本。
     # 五个起点分别独立回测
     period_results = run_period_comparisons(
-        prices=comparison_prices,
+        prices=prices,
         start_years=[2022, 2023, 2024, 2025, 2026],
         last_signal_month="2026-09",
         backtest_end="2026-10-30",
@@ -1136,4 +1118,5 @@ if __name__ == "__main__":
         performance=performance,
         output_dir=project_dir / "figures",
         period_results=period_results,
+        prices=prices,
     )
