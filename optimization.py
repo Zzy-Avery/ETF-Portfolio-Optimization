@@ -265,14 +265,51 @@ def min_variance_equal_return(
 ) -> pd.Series:
     """估计收益不低于等权组合时，计算最小方差组合权重。"""
 
-    # 按平均收益率的 ETF 顺序排列协方差矩阵
+    # 检查资产名称，确保均值与协方差覆盖相同资产。
     asset_names = mean_returns.index
+    n = len(asset_names)
+
+    if n == 0 or asset_names.has_duplicates:
+        raise ValueError("平均收益率的资产名单必须非空且不能重复")
+
+    if covariance.shape != (n, n):
+        raise ValueError("协方差矩阵的维数必须与平均收益率一致")
+
+    if (
+            covariance.index.has_duplicates
+            or covariance.columns.has_duplicates
+            or not asset_names.isin(covariance.index).all()
+            or not asset_names.isin(covariance.columns).all()
+    ):
+        raise ValueError("协方差矩阵必须覆盖相同资产，且行列名称不能重复")
+
+    # 按平均收益率的资产顺序对齐协方差矩阵。
     mu = mean_returns.to_numpy(dtype=float)
     sigma = covariance.loc[
         asset_names, asset_names
     ].to_numpy(dtype=float)
 
-    n = len(mu)
+    if not np.isfinite(mu).all():
+        raise ValueError("平均收益率存在缺失值或无穷值")
+
+    if not np.isfinite(sigma).all():
+        raise ValueError("协方差矩阵存在缺失值或无穷值")
+
+    # 协方差必须对称；消除浮点计算产生的微小不对称。
+    if not np.allclose(sigma, sigma.T, rtol=1e-8, atol=1e-12):
+        raise ValueError("协方差矩阵必须对称")
+
+    sigma = (sigma + sigma.T) / 2
+
+    # 半正定性保证任意组合的理论方差非负，也保证目标函数凸。
+    matrix_scale = np.max(np.abs(sigma))
+
+    if matrix_scale > 0:
+        scaled_eigenvalues = np.linalg.eigvalsh(
+            sigma / matrix_scale
+        )
+        if scaled_eigenvalues.min() < -1e-10:
+            raise ValueError("协方差矩阵不是半正定矩阵")
 
     # 等权组合的估计平均日收益率
     target_return = mu.mean()
