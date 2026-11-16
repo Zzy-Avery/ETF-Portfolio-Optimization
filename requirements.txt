@@ -3,3 +3,4 @@ pandas
 scipy
 matplotlib
 scikit-learn
+lxml
